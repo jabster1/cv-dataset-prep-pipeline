@@ -60,7 +60,14 @@ class IngestConfig:
 class DedupConfig:
     enabled: bool = True
     hash_size: int = 8
+    # A pair is a near-duplicate when pHash distance <= near_duplicate_threshold AND
+    # dHash distance <= dhash_threshold (null = pHash only). Distances are in bits out of
+    # hash_size**2.
     near_duplicate_threshold: int = 6
+    dhash_threshold: int | None = 10
+    # Actions only mark items in manifests/dedup.csv; files are never deleted.
+    exact_duplicate_action: Literal["exclude", "keep"] = "exclude"
+    near_duplicate_action: Literal["keep", "exclude"] = "keep"
     group_near_duplicates: bool = True
 
 
@@ -213,8 +220,17 @@ def validate_config(cfg: PipelineConfig) -> None:
     check(1 <= v.jpeg_quality <= 100, "ingest.video.jpeg_quality must be in [1, 100]")
 
     # Dedup
-    check(cfg.dedup.hash_size >= 4, "dedup.hash_size must be >= 4")
-    check(cfg.dedup.near_duplicate_threshold >= 0, "dedup.near_duplicate_threshold must be >= 0")
+    d = cfg.dedup
+    bits = d.hash_size**2
+    check(4 <= d.hash_size <= 32, "dedup.hash_size must be in [4, 32]")
+    check(
+        0 <= d.near_duplicate_threshold < bits,
+        f"dedup.near_duplicate_threshold must be in [0, {bits}) for hash_size {d.hash_size}",
+    )
+    check(
+        d.dhash_threshold is None or 0 <= d.dhash_threshold < bits,
+        f"dedup.dhash_threshold must be null or in [0, {bits}) for hash_size {d.hash_size}",
+    )
 
     # Annotation
     a = cfg.annotation

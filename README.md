@@ -7,7 +7,7 @@ names in a YAML config, and run one command.
 Nothing is project-specific: the first use case is Lockout/Tagout (LOTO) detection, but
 the same pipeline works for tools, industrial equipment, or anything else.
 
-> **Status:** Phase 1 of 7 is implemented (foundation + ingestion). See
+> **Status:** Phases 1–2 of 7 are implemented (foundation, ingestion, deduplication). See
 > [Roadmap](#roadmap). Commands for later stages are documented as they land.
 
 ---
@@ -50,10 +50,11 @@ Then look in `workspaces/example/`.
 
 | Command | What it does | Status |
 |---|---|---|
-| `python -m cv_pipeline prepare --config C` | Run every preparation stage in order | ✅ (currently: ingest) |
+| `python -m cv_pipeline prepare --config C` | Run every preparation stage in order | ✅ (currently: ingest → dedup) |
 | `python -m cv_pipeline ingest --config C` | Copy images, sample video frames, write lineage manifest | ✅ |
+| `python -m cv_pipeline dedup --config C` | Exact + near-duplicate detection, split groups, duplicates report | ✅ |
 | `python -m cv_pipeline show-config --config C` | Print the fully resolved config | ✅ |
-| `dedup`, `annotate`, `split`, `augment`, `export` | Individual stages | Phases 2–6 |
+| `annotate`, `split`, `augment`, `export` | Individual stages | Phases 3–6 |
 | `python -m cv_pipeline validate --config C` | Dataset checks + report | Phase 6 |
 | `python -m cv_pipeline train --config C` | Optional Ultralytics training | Phase 7 |
 
@@ -79,6 +80,42 @@ data/loto/raw/
 - Unsupported, unreadable, and byte-identical duplicate files are listed in
   `manifests/rejected.csv`. Hidden files (`.DS_Store`, …) are ignored and counted in the log.
 
+## Duplicates
+
+`dedup` runs after ingest and never deletes or moves anything. It distinguishes:
+
+| Kind | How it is found | Default handling |
+|---|---|---|
+| Byte-identical raw files (incl. renamed/moved copies) | SHA-256 at ingest | Only the first (by path) is ingested; the rest are listed in `rejected.csv` and the report |
+| Byte-identical items | same `sha256` | Copies after the first are **excluded** (`exact_duplicate_action`) |
+| Pixel-identical items (same pixels, different bytes) | SHA-256 of decoded pixels | Copies after the first are **excluded** |
+| Near-duplicates across sources (two photos of one scene, a photo and a video frame) | pHash ≤ `near_duplicate_threshold` **and** dHash ≤ `dhash_threshold` | **Kept**, linked, and put in the **same split group** |
+| Near-duplicates within one source (adjacent video frames) | same | **Never linked or excluded**; summarised per video in the report |
+
+Why same-source similarity is ignored: a video's frames already share a `source_id`, so
+they always land in the same split and can't leak. A run of similar frames is often
+exactly the data you want. If the report shows a video is highly redundant, lower
+`ingest.video.fps` instead.
+
+"Excluded" means `excluded=true` in `manifests/dedup.csv` with a reason and
+`duplicate_of`. Later stages skip those items, but the files and their `items.csv` rows
+remain. The kept copy is chosen deterministically: still images before video frames,
+then by path, frame index and ID.
+
+Outputs:
+
+- `manifests/dedup.csv`: per item, its hashes, `dup_group`, `excluded` / `exclude_reason` /
+  `duplicate_of`, and `split_group` (the unit the splitter will assign to train/val/test)
+- `manifests/duplicate_pairs.csv`: every linked pair with its kind and Hamming distances
+- `reports/duplicates.json` + `reports/duplicates.md`: summary, groups, video redundancy,
+  and warnings (e.g. one split group larger than the test split)
+- `manifests/image_hashes.csv`: hash cache, so re-runs only hash new files
+
+Tuning: distances are in bits out of `hash_size²` (64 by default). Raise the thresholds
+to catch more aggressive edits (crops, re-framing); lower them if unrelated images get
+linked. Pair search compares every pair, so cost grows with n²: about 0.6 s for 5k items
+and 8.5 s for 20k on a laptop.
+
 ## Configuration
 
 See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
@@ -90,7 +127,7 @@ See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
 | `project` | `name`, `workspace` (output dir), `seed` |
 | `classes` | Class names in YOLO id order |
 | `ingest` | `raw_dir`, accepted extensions, video sampling |
-| `dedup` | Perceptual-hash size, near-duplicate threshold, grouping for splits |
+| `dedup` | Hash size, pHash/dHash thresholds, exact/near-duplicate actions, grouping for splits |
 | `annotation` | Backend (`yolo`), `model`, confidence / review thresholds, `class_map` |
 | `split` | `train` / `val` / `test` fractions (must sum to 1) |
 | `augmentation` | Copies per **train** image, transforms and their probabilities |
@@ -119,9 +156,10 @@ cv_pipeline/
     config.py        typed schema, strict YAML loading, validation, path resolution
     pipeline.py      stage registry used by `prepare`
     workspace.py     workspace directory layout
-    manifest.py      typed CSV manifests (ItemRecord, RejectedRecord)
+    manifest.py      typed CSV manifests (ItemRecord, RejectedRecord, DedupRecord, ...)
     synthetic.py     synthetic scenes/videos for tests and demos
     ingest/          image copy + video frame sampling
+    dedup/           perceptual/pixel hashing, pair search, grouping, duplicates report
     utils/           structured logging, hashing, atomic file I/O
 configs/             example.yaml, loto.example.yaml
 examples/            make_synthetic_raw.py
@@ -137,7 +175,12 @@ tests/
     manifests/
         items.csv             one row per image, with lineage
         rejected.csv          files not carried forward, with reason
-    reports/ingest_summary.json
+        dedup.csv             per-item duplicate status + split_group
+        duplicate_pairs.csv   linked pairs with kind and distances
+        image_hashes.csv      hash cache
+    reports/
+        ingest_summary.json
+        duplicates.json / duplicates.md
     logs/pipeline.jsonl       structured JSON-lines log of every run
 ```
 
@@ -162,7 +205,7 @@ Later phases add `labels/`, `review/`, `dataset/`, `runs/` and more manifests.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Foundation, config, logging, manifests, ingestion (images + videos), CLI, tests | ✅ |
-| 2 | Exact + perceptual-hash near-duplicate detection, duplicates report | ⏳ |
+| 2 | Exact + perceptual-hash near-duplicate detection, duplicates report | ✅ |
 | 3 | Pluggable annotation (YOLO backend), previews, review queue + manifest, label import/export | ⏳ |
 | 4 | Source-grouped deterministic train/val/test split, persistent split manifest | ⏳ |
 | 5 | Albumentations augmentation of train only, bbox-safe, lineage | ⏳ |
