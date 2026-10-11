@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Pipeline data — raw data and generated workspaces never belong in git
+data/
+workspaces/
+runs/
+*.pt
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
