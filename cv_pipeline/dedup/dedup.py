@@ -3,8 +3,8 @@
 Policy
 ------
 * **Exact duplicates** (byte- or pixel-identical, any source) carry no extra information.
-  ``exact_duplicate_action: exclude`` (default) keeps one representative and marks the
-  rest excluded with ``duplicate_of``.
+  ``exact_duplicate_action: exclude`` (default) keeps one canonical copy (see
+  :func:`_priority`) and marks the rest excluded with ``duplicate_of``.
 * **Near-duplicates across different sources** (two photos of the same scene, a photo and
   a video frame) are a leakage risk. They are always recorded and, with
   ``group_near_duplicates``, forced into the same ``split_group``. They are only excluded
@@ -27,6 +27,7 @@ from itertools import combinations
 
 import numpy as np
 
+from cv_pipeline.canonical import canonical_path_key
 from cv_pipeline.config import DedupConfig, PipelineConfig
 from cv_pipeline.dedup.hashing import ImageHashes, compute_hashes, hamming, hex_matrix, near_pairs
 from cv_pipeline.dedup.report import build_report, render_markdown
@@ -50,7 +51,7 @@ from cv_pipeline.workspace import Workspace
 
 logger = get_logger("dedup")
 
-_TYPE_RANK = {SourceType.IMAGE: 0, SourceType.VIDEO_FRAME: 1, SourceType.AUGMENTED: 2}
+_TYPE_RANK = {SourceType.VIDEO_FRAME: 0, SourceType.IMAGE: 1, SourceType.AUGMENTED: 2}
 
 
 @dataclass
@@ -230,11 +231,15 @@ def _group_by(
 # --------------------------------------------------------------------------------------
 
 
-def _priority(item: ItemRecord) -> tuple[int, str, int, str]:
-    """Deterministic preference for which copy to keep: still images, then by path/frame."""
+def _priority(item: ItemRecord) -> tuple[object, ...]:
+    """Which copy to keep; lower wins. See :mod:`cv_pipeline.canonical` for the rule."""
+    copy_like, depth, normalized, path = canonical_path_key(item.source_path)
     return (
+        copy_like,
         _TYPE_RANK.get(item.source_type, 9),
-        item.source_path,
+        depth,
+        normalized,
+        path,
         item.frame_index if item.frame_index is not None else -1,
         item.item_id,
     )

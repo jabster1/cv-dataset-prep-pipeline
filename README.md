@@ -86,9 +86,9 @@ data/loto/raw/
 
 | Kind | How it is found | Default handling |
 |---|---|---|
-| Byte-identical raw files (incl. renamed/moved copies) | SHA-256 at ingest | Only the first (by path) is ingested; the rest are listed in `rejected.csv` and the report |
-| Byte-identical items | same `sha256` | Copies after the first are **excluded** (`exact_duplicate_action`) |
-| Pixel-identical items (same pixels, different bytes) | SHA-256 of decoded pixels | Copies after the first are **excluded** |
+| Byte-identical raw files (incl. renamed/moved copies) | SHA-256 at ingest | Only the canonical copy is ingested; the rest are listed in `rejected.csv` and the report |
+| Byte-identical items | same `sha256` | Non-canonical copies are **excluded** (`exact_duplicate_action`) |
+| Pixel-identical items (same pixels, different bytes) | SHA-256 of decoded pixels | Non-canonical copies are **excluded** |
 | Near-duplicates across sources (two photos of one scene, a photo and a video frame) | pHash ≤ `near_duplicate_threshold` **and** dHash ≤ `dhash_threshold` | **Kept**, linked, and put in the **same split group** |
 | Near-duplicates within one source (adjacent video frames) | same | **Never linked or excluded**; summarised per video in the report |
 
@@ -99,8 +99,23 @@ exactly the data you want. If the report shows a video is highly redundant, lowe
 
 "Excluded" means `excluded=true` in `manifests/dedup.csv` with a reason and
 `duplicate_of`. Later stages skip those items, but the files and their `items.csv` rows
-remain. The kept copy is chosen deterministically: still images before video frames,
-then by path, frame index and ID.
+remain.
+
+**Which identical copy is canonical** (deterministic; lower wins, see
+[`cv_pipeline/canonical.py`](cv_pipeline/canonical.py)):
+
+1. A path that doesn't look like a copy. "Looks like a copy" means a directory or
+   file-stem word is `duplicate(s)`, `dup(s)`, `copy`, `copies` or `backup`, or the name
+   ends in ` (1)`.
+2. A video frame before a still image. This only applies to pixel-identical items: a still
+   identical to an extracted frame was exported from it, and keeping the frame keeps the
+   sequence whole.
+3. Fewer directory levels.
+4. The path with Unicode normalised and case ignored, then the path as-is (then frame
+   index and ID).
+
+For example, `images/scene.jpg` beats `images/duplicates/scene.jpg`, `images/scene (1).jpg`
+and `images/site/a/scene.jpg`.
 
 Outputs:
 

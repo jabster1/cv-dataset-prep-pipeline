@@ -14,7 +14,15 @@ from cv_pipeline.config import PipelineConfig, load_config
 from cv_pipeline.dedup import DedupResult, run_dedup
 from cv_pipeline.dedup.hashing import compute_hashes, hamming
 from cv_pipeline.ingest import run_ingest
-from cv_pipeline.manifest import DedupRecord, DuplicateKind, ExcludeReason, ItemRecord, read_records
+from cv_pipeline.manifest import (
+    DedupRecord,
+    DuplicateKind,
+    ExcludeReason,
+    ItemRecord,
+    RejectedRecord,
+    RejectReason,
+    read_records,
+)
 from cv_pipeline.synthetic import render_scene, write_synthetic_video
 from cv_pipeline.workspace import Workspace
 
@@ -129,6 +137,75 @@ def test_byte_identical_and_renamed_files_are_reported(project) -> None:
     assert len(result.records) == 2
     md = (Workspace(cfg.workspace_dir).reports / "duplicates.md").read_text(encoding="utf-8")
     assert "nested/renamed_copy.png" in md
+
+
+def test_canonical_raw_copy_is_not_the_one_in_a_duplicates_folder(project) -> None:
+    raw, run = project
+    save(raw / "scene_001.png", scene(1))
+    (raw / "duplicates").mkdir()
+    # Both copies sort before "scene_001.png", which used to make one of them canonical.
+    shutil.copyfile(raw / "scene_001.png", raw / "duplicates" / "renamed_copy_of_scene_001.png")
+    shutil.copyfile(raw / "scene_001.png", raw / "scene_001 (1).png")
+
+    result, cfg = run()
+    recs = by_source_path(result, cfg)
+    assert set(recs) == {"scene_001.png"}
+    canonical_id = recs["scene_001.png"].item_id
+    rejected = read_records(Workspace(cfg.workspace_dir).rejected_manifest, RejectedRecord)
+    assert {r.source_path: (r.reason, r.duplicate_of, r.detail) for r in rejected} == {
+        "images/duplicates/renamed_copy_of_scene_001.png": (
+            RejectReason.EXACT_DUPLICATE, canonical_id, "byte-identical to images/scene_001.png"
+        ),
+        "images/scene_001 (1).png": (
+            RejectReason.EXACT_DUPLICATE, canonical_id, "byte-identical to images/scene_001.png"
+        ),
+    }
+
+
+def test_canonical_pixel_identical_item_prefers_non_copy_path(project) -> None:
+    raw, run = project
+    img = scene(5)
+    save(raw / "backup" / "a.png", img, [cv2.IMWRITE_PNG_COMPRESSION, 1])  # sorts first
+    save(raw / "z.png", img, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+
+    result, cfg = run()
+    recs = by_source_path(result, cfg)
+    assert not recs["z.png"].excluded
+    assert recs["backup/a.png"].excluded
+    assert recs["backup/a.png"].duplicate_of == recs["z.png"].item_id
+
+
+def test_canonical_pixel_identical_prefers_shallower_path(project) -> None:
+    raw, run = project
+    img = scene(5)
+    save(raw / "site" / "a.png", img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    save(raw / "z.png", img, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+    result, cfg = run()
+    recs = by_source_path(result, cfg)
+    assert recs["site/a.png"].duplicate_of == recs["z.png"].item_id
+
+
+def test_video_frame_is_canonical_over_a_still_exported_from_it(project, tmp_path: Path) -> None:
+    raw, run = project
+    video = tmp_path / "raw" / "videos" / "clip.mp4"
+    write_synthetic_video(video, n_frames=6, fps=10.0, rng=np.random.default_rng(2))
+    cap = cv2.VideoCapture(str(video))
+    for _ in range(4):
+        ok, frame = cap.read()
+    cap.release()
+    assert ok
+    # pixel-identical to frame 3, but different bytes from the pipeline's own PNG encoding
+    save(raw / "a_exported_frame.png", frame, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+
+    result, cfg = run({"ingest": {"video": {"mode": "every_n_frames", "every_n_frames": 1,
+                                            "image_format": "png"}}})
+    recs = by_source_path(result, cfg)
+    still = recs["a_exported_frame.png"]
+    frames = {r.item_id: r for r in result.records if r.source_id.startswith("vid_")}
+    assert len(frames) == 6 and not any(r.excluded for r in frames.values())
+    assert still.excluded and still.exclude_reason == ExcludeReason.EXACT_DUPLICATE
+    assert still.duplicate_of in frames and still.duplicate_of.endswith("_f000003")
+    assert [p.kind for p in result.pairs] == [DuplicateKind.PIXEL_IDENTICAL]
 
 
 def test_pixel_identical_files_excluded_by_default(project) -> None:

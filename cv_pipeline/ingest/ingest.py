@@ -5,6 +5,9 @@ Guarantees
 * Raw files are only ever opened for reading.
 * Every raw file ends up either in ``items.csv`` (possibly as many frames) or in
   ``rejected.csv`` with a reason — nothing is dropped silently.
+* Among byte-identical raw files, the canonical copy is chosen by
+  :func:`cv_pipeline.canonical.canonical_path_key` (e.g. ``images/x.jpg`` wins over
+  ``images/duplicates/x.jpg``); the others are recorded as ``exact_duplicate``.
 * IDs are content-addressed, so renaming/moving raw files does not change them, and
   re-running with the same inputs and config produces identical manifests.
 * Re-runs are incremental: items whose outputs already exist are reused unless
@@ -17,8 +20,9 @@ import logging
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from cv_pipeline.canonical import canonical_path_key
 from cv_pipeline.config import PipelineConfig
 from cv_pipeline.ingest.images import ImageReadError, image_item_id, ingest_image
 from cv_pipeline.ingest.video import VideoReadError, iter_frames, probe_video, select_frame_indices
@@ -102,11 +106,13 @@ def run_ingest(cfg: PipelineConfig, force: bool = False) -> IngestResult:
 
     image_exts = set(cfg.ingest.image_extensions)
     video_exts = set(cfg.ingest.video_extensions)
-    seen_sha: dict[str, str] = {}  # sha256 -> item/source id of first occurrence
     t0 = time.perf_counter()
     log_event(logger, "ingest_started", raw_dir=str(raw_dir), files=len(files), force=force)
 
-    for n, src in enumerate(files, start=1):
+    # Pass 1: classify and hash, so byte-identical files can be resolved to a canonical
+    # copy independently of discovery order.
+    supported: list[tuple[Path, str, str]] = []  # (path, rel, sha256)
+    for src in files:
         rel = rel_posix(src, raw_dir)
         ext = src.suffix.lower()
         if ext not in image_exts and ext not in video_exts:
@@ -115,25 +121,32 @@ def run_ingest(cfg: PipelineConfig, force: bool = False) -> IngestResult:
             )
             log_event(logger, "file_rejected", logging.WARNING, file=rel, reason="unsupported_extension")
             continue
+        supported.append((src, rel, sha256_file(src)))
 
-        sha = sha256_file(src)
-        if sha in seen_sha:
+    canonical: dict[str, str] = {}  # sha256 -> rel path of the canonical copy
+    for _, rel, sha in supported:
+        if sha not in canonical or canonical_path_key(rel) < canonical_path_key(canonical[sha]):
+            canonical[sha] = rel
+
+    # Pass 2: ingest canonical copies; record the others as exact duplicates.
+    for n, (src, rel, sha) in enumerate(supported, start=1):
+        is_image = src.suffix.lower() in image_exts
+        if canonical[sha] != rel:
+            keep = canonical[sha]
+            keep_is_image = PurePosixPath(keep).suffix.lower() in image_exts
+            keep_id = image_item_id(sha) if keep_is_image else video_source_id(sha)
             result.rejected.append(
-                RejectedRecord(rel, RejectReason.EXACT_DUPLICATE, "byte-identical to an earlier file",
-                               duplicate_of=seen_sha[sha])
+                RejectedRecord(rel, RejectReason.EXACT_DUPLICATE, f"byte-identical to {keep}",
+                               duplicate_of=keep_id)
             )
-            log_event(logger, "exact_duplicate", logging.WARNING, file=rel, duplicate_of=seen_sha[sha])
-            continue
-
-        if ext in image_exts:
-            seen_sha[sha] = image_item_id(sha)
+            log_event(logger, "exact_duplicate", logging.WARNING, file=rel, canonical=keep)
+        elif is_image:
             _ingest_one_image(src, rel, sha, raw_dir, ws, previous, result)
         else:
-            seen_sha[sha] = video_source_id(sha)
             _ingest_one_video(src, rel, sha, raw_dir, ws, cfg, previous, result)
 
         if n % _PROGRESS_EVERY == 0:
-            log_event(logger, "ingest_progress", processed=n, total=len(files))
+            log_event(logger, "ingest_progress", processed=n, total=len(supported))
 
     result.items.sort(key=lambda r: r.item_id)
     write_records(ws.items_manifest, result.items, ItemRecord)
