@@ -31,11 +31,18 @@ the same pipeline works for tools, industrial equipment, or anything else.
 Requires Python 3.11+.
 
 ```bash
-python -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+pip install -e ".[dev]" -c constraints.txt
 pytest
 ```
+
+[`constraints.txt`](constraints.txt) pins the tested combination of the dependencies that
+matter for reproducibility. It is especially important for OpenCV: Ultralytics depends on
+`opencv-python` and albumentations on `opencv-python-headless`, and both install the same
+`cv2` module, so their versions must match. Torch is left to pip and Ultralytics because
+its wheels are platform-specific. Installing without `-c constraints.txt` works but may
+resolve untested versions.
 
 ## Quick start (synthetic demo data)
 
