@@ -107,11 +107,21 @@ class ReviewConfig:
     previews: bool = True
 
 
+SplitName = Literal["train", "val", "test"]
+
+
 @dataclass
 class SplitConfig:
     train: float = 0.7
     val: float = 0.2
     test: float = 0.1
+    # Tie-break seed for allocating NEW groups; null -> project.seed.
+    seed: int | None = None
+    # Give every split with fraction > 0 at least one new group when feasible.
+    require_nonempty: bool = True
+    # Explicit resolutions for split-history conflicts: {split_group: split}. Only the
+    # most protected historical split (test > val > train) is accepted.
+    conflict_resolutions: dict[str, SplitName] = field(default_factory=dict)
 
 
 @dataclass

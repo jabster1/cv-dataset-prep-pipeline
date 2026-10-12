@@ -70,9 +70,18 @@ review:
   previews: true                  # draw predictions into review/previews
 
 split:
+  # Fractions of items (they must sum to 1; val/test may be 0). Split groups from dedup are
+  # indivisible, so achieved fractions can deviate; the report explains how and why.
   train: 0.7
   val: 0.2
   test: 0.1
+  seed: null                      # tie-break seed for NEW groups; null = project.seed
+  require_nonempty: true          # give every requested split at least one new group if possible
+  # Assignments persist: existing groups never move. If later grouping merges groups that
+  # were assigned to different splits, `split` stops (exit 4). A targeted fix may only keep
+  # the most protected historical split (test > val > train), e.g. {sg_3fa9c0e1b2d4: test}.
+  # Anything else requires `split --resplit` (preview, reason, confirmation token).
+  conflict_resolutions: {}
 
 augmentation:
   enabled: true

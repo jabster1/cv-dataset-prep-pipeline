@@ -83,6 +83,26 @@ class Workspace:
         return self.manifests / "image_hashes.csv"
 
     @property
+    def splits(self) -> Path:
+        return self.root / "splits"
+
+    @property
+    def split_groups_manifest(self) -> Path:
+        return self.splits / "groups.csv"
+
+    @property
+    def split_sources_manifest(self) -> Path:
+        return self.splits / "group_sources.csv"
+
+    @property
+    def split_revisions(self) -> Path:
+        return self.splits / "revisions.jsonl"
+
+    @property
+    def split_items_manifest(self) -> Path:
+        return self.splits / "items.csv"
+
+    @property
     def resolved_config(self) -> Path:
         return self.root / "config.resolved.yaml"
 

@@ -7,8 +7,8 @@ names in a YAML config, and run one command.
 Nothing is project-specific: the first use case is Lockout/Tagout (LOTO) detection, but
 the same pipeline works for tools, industrial equipment, or anything else.
 
-> **Status:** Phases 1–3 of 7 are implemented (foundation, ingestion, deduplication,
-> automatic annotation). See
+> **Status:** Phases 1–4 of 7 are implemented (foundation, ingestion, deduplication,
+> automatic annotation, source-aware splitting). See
 > [Roadmap](#roadmap). Commands for later stages are documented as they land.
 
 ---
@@ -58,12 +58,14 @@ Then look in `workspaces/example/`.
 
 | Command | What it does | Status |
 |---|---|---|
-| `python -m cv_pipeline prepare --config C` | Run every enabled preparation stage in order | ✅ (currently: ingest → dedup → annotate if `annotation.enabled`) |
+| `python -m cv_pipeline prepare --config C` | Run every enabled preparation stage in order | ✅ (currently: ingest → dedup → annotate if `annotation.enabled` → split) |
 | `python -m cv_pipeline ingest --config C` | Copy images, sample video frames, write lineage manifest | ✅ |
 | `python -m cv_pipeline dedup --config C` | Exact + near-duplicate detection, split groups, duplicates report | ✅ |
 | `python -m cv_pipeline annotate --config C [--limit N]` | Pre-label eligible images with a detector; build the review queue | ✅ |
+| `python -m cv_pipeline split --config C [--dry-run]` | Source-aware train/val/test assignment that preserves history | ✅ |
+| `python -m cv_pipeline split --config C --resplit --reason TEXT [--confirm TOKEN]` | Deliberately rebuild all assignments (previews unless confirmed) | ✅ |
 | `python -m cv_pipeline show-config --config C` | Print the fully resolved config | ✅ |
-| `split`, `augment`, `export` | Individual stages | Phases 4–6 |
+| `augment`, `export` | Individual stages | Phases 5–6 |
 | `python -m cv_pipeline validate --config C` | Dataset checks + report | Phase 6 |
 | `python -m cv_pipeline train --config C` | Optional Ultralytics training | Phase 7 |
 
@@ -78,6 +80,7 @@ Exit codes:
 | 1 | A stage could not run (missing inputs, missing or invalid model, unknown backend, ...) |
 | 2 | Invalid configuration |
 | 3 | Annotation completed and all outputs were written, but one or more items failed inference (see `reports/annotation.md`) |
+| 4 | Split-history conflict. Nothing in `splits/` was changed (see `reports/split.md`) |
 
 ## Adding images and videos
 
@@ -274,6 +277,104 @@ A later phase adds importing review decisions. Those will produce records with t
 box schema, `provenance=human` and `based_on_run_id`, so dataset export can prefer
 human-reviewed labels.
 
+## Train/val/test splitting
+
+`split` assigns every eligible item to `train`, `val` or `test`. It depends only on the
+validated ingest and dedup state (`item_id`, `source_id`, `split_group`, file identity),
+**never on machine predictions**, so it works with annotation disabled, with manual
+labels, or with no labels yet. `prepare` runs it after dedup (and after annotate, when
+that's enabled).
+
+Priorities, in order:
+
+1. **Prevent leakage.** A dedup `split_group` is indivisible. All frames of a video, and
+   all near- or exact-duplicates across sources, stay in one split.
+2. **Preserve history.** A group that has been assigned keeps its split forever. Adding
+   data never reshuffles existing val or test items.
+3. **Match the requested fractions** as closely as whole groups allow. The report shows
+   requested and achieved fractions and explains any gap.
+
+**Input check.** Before splitting, the stage confirms that:
+
+- `dedup.csv` covers exactly the items in `items.csv`, with the same `source_id`s;
+- it was produced with the current dedup settings;
+- it was computed from the files currently on disk (via the dedup hash cache).
+
+If any check fails, the stage refuses to run (exit 1) and asks you to re-run dedup.
+
+The validated rows (`item_id, source_id, source_type, frame_index, split_group,
+file_sha256`) form the split-input snapshot, and its fingerprint `snapshot_fp` is recorded
+with every revision. If the active annotation run was made from exactly this state, its
+`run_id` is recorded as optional lineage. Otherwise lineage is reported as `stale` or
+`none`, and splitting still proceeds.
+
+### What happens to history
+
+| Situation | Result |
+|---|---|
+| Same group (same set of sources) | Keeps its split (`retained`; `items_changed` if, e.g., a video was re-sampled) |
+| New sources join a group whose sources were all in one split | The whole group **inherits** that split (`extended`) |
+| A historical group divides | Each part keeps the split (`regrouped`) |
+| A group disappears | Kept as `inactive` history; **restored** to its old split if it reappears |
+| A new group | Allocated (below) |
+| **A group now contains sources from different historical splits** | **Conflict**: exit 4, nothing in `splits/` is changed, `reports/split.md` explains it |
+
+**Resolving a conflict.** A targeted entry in `split.conflict_resolutions` may only name
+the **most protected** historical split (`test > val > train`):
+
+| Historical splits | Allowed resolution |
+|---|---|
+| train + test | `test` |
+| train + val | `val` |
+| val + test | `test` |
+
+Any other value is rejected. An entry for a group that isn't in conflict, and wasn't
+resolved that way before, is a configuration error (exit 2). Moving held-out data toward
+training requires a full resplit.
+
+### Allocation of new groups
+
+1. New groups are placed largest first, with a seeded, stable tie-break
+   (`split.seed`, default `project.seed`).
+2. Each group goes to the split with the smallest increase in target-relative squared
+   error, `((c+n-t)² - (c-t)²) / t`. Ties prefer train, then val, then test.
+3. Splits with fraction 0 never receive groups.
+4. With `require_nonempty: true` (the default): if best-fit would leave a requested val or
+   test split empty, the smallest new groups are reserved for those splits first, as long
+   as a group remains for train.
+
+History is never moved to fill a split. When filling is impossible (too few groups, or no
+new groups), the report warns instead.
+
+### Full resplit (deliberate only)
+
+```bash
+python -m cv_pipeline split --config C --resplit --reason "dedup thresholds re-tuned"
+#   -> preview: every move (e.g. test->train: 12 items) and a confirmation token; nothing written
+python -m cv_pipeline split --config C --resplit --reason "dedup thresholds re-tuned" --confirm <token>
+```
+
+- `prepare` never resplits.
+- The token is tied to the current history, so it stops working as soon as anything
+  changes.
+- Before rewriting, the current history is archived to `splits/archive/rev_NNNN/`.
+- Moves of held-out data toward training are flagged with a loud warning.
+
+`--dry-run` computes and reports without writing anything.
+
+### Outputs
+
+| File | Role |
+|---|---|
+| `splits/groups.csv` | **Persistent history**, one row per group ever assigned: split, active/inactive status, source/item counts with set fingerprints, reason (`allocated`, `inherited`, `conflict_resolution`, `resplit`), first and last revision |
+| `splits/group_sources.csv` | **Persistent** source-level memory: `source_id → split_group, split, status`. This is what detects merges and restores reappearing data. |
+| `splits/revisions.jsonl` | **Append-only**, one line per revision that changed anything: mode, `snapshot_fp`, dedup settings fingerprint, annotation lineage, split config, change counts, applied resolutions, resplit details, and a `state_digest` that is checked on every load |
+| `splits/items.csv` | **Current materialised view**: `item_id, source_id, source_type, split_group, split, reason, assigned_in_revision` |
+| `reports/split.json` / `.md` | Requested vs achieved, why they differ, changes, warnings, conflicts |
+
+The outputs are deterministic: the same snapshot, history and config give byte-identical
+files, whatever the row or filesystem order.
+
 ## Configuration
 
 See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
@@ -288,7 +389,7 @@ See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
 | `dedup` | Hash size, pHash/dHash thresholds, exact/near-duplicate actions, grouping for splits |
 | `annotation` | Backend (`yolo`), `model`, thresholds, batch size, `class_map`, review triggers, audit sample rate, backend `options` |
 | `review` | Which items to export (`flagged` / `all`), copy images, draw previews |
-| `split` | `train` / `val` / `test` fractions (must sum to 1) |
+| `split` | `train` / `val` / `test` fractions (sum to 1; val/test may be 0), tie-break `seed`, `require_nonempty`, `conflict_resolutions` |
 | `augmentation` | Copies per **train** image, transforms and their probabilities |
 | `training` | Ultralytics model, epochs, imgsz, batch, device, patience |
 
@@ -304,7 +405,7 @@ individually, and `prepare` is just "run them in order".
 ```
 raw/ ──ingest──▶ items.csv ──dedup──▶ dedup.csv ──annotate──▶ annotations/ + review/
                                                                        │ (human review)
-dataset/ ◀──export── augmentations.csv ◀──augment (train only)── splits.csv ◀──split──┘
+dataset/ ◀──export── augmentations.csv ◀──augment (train only)── splits/ ◀──split──┘
    │
    └──validate──▶ reports/validation.{json,md}            train ──▶ runs/   (separate)
 ```
@@ -321,6 +422,8 @@ cv_pipeline/
     dedup/           perceptual/pixel hashing, pair search, grouping, duplicates report
     annotation/      backend protocol + registry, YOLO backend, policy, identities, cache,
                      immutable run snapshots, review queue, previews, report
+    dataset_state.py validated ingest/dedup state + split-input snapshot fingerprint
+    splitting/       history, reconciliation, deterministic allocation, split report
     utils/           structured logging, hashing, atomic file I/O
 configs/             example.yaml, loto.example.yaml
 examples/            make_synthetic_raw.py
@@ -345,10 +448,17 @@ tests/
         cache/inference/      raw detections by (inference_fp, input_pixel_sha256)
         cache/models/         model class names by model sha256
     review/                   review queue (see "Reviewing predictions")
+    splits/
+        groups.csv            persistent group assignments (active + inactive)
+        group_sources.csv     persistent source-level assignment memory
+        revisions.jsonl       append-only revision log
+        items.csv             current item -> split view
+        archive/rev_NNNN/     history before each deliberate resplit
     reports/
         ingest_summary.json
         duplicates.json / duplicates.md
         annotation.json / annotation.md
+        split.json / split.md
     logs/pipeline.jsonl       structured JSON-lines log of every run
 ```
 
@@ -375,7 +485,7 @@ Later phases add `dataset/`, `runs/` and more manifests.
 | 1 | Foundation, config, logging, manifests, ingestion (images + videos), CLI, tests | ✅ |
 | 2 | Exact + perceptual-hash near-duplicate detection, duplicates report | ✅ |
 | 3 | Pluggable annotation (YOLO backend), confidence/review policy, immutable run snapshots, review queue | ✅ |
-| 4 | Source-grouped deterministic train/val/test split, persistent split manifest | ⏳ |
+| 4 | Source-aware deterministic train/val/test split with persistent history, conflict handling and deliberate resplit | ✅ |
 | 5 | Albumentations augmentation of train only, bbox-safe, lineage | ⏳ |
 | 6 | YOLO dataset export + `dataset.yaml`, validation checks, JSON + Markdown report | ⏳ |
 | 7 | Optional `train` command, end-to-end test, full documentation | ⏳ |

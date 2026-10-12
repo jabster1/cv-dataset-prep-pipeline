@@ -11,7 +11,9 @@ import yaml
 from cv_pipeline import __version__
 from cv_pipeline.annotation import AnnotationSetupError, run_annotate
 from cv_pipeline.config import ConfigError, PipelineConfig, load_config
+from cv_pipeline.dataset_state import DatasetStateError
 from cv_pipeline.pipeline import STAGES, exit_code_of, get_stage, run_prepare
+from cv_pipeline.splitting import SplitError, SplitHistoryError, run_split
 from cv_pipeline.utils.io import atomic_write_text
 from cv_pipeline.utils.logging import get_logger, setup_logging
 from cv_pipeline.workspace import Workspace
@@ -23,6 +25,7 @@ EPILOG = """exit codes:
   1  stage could not run (missing inputs, missing/invalid model, ...)
   2  invalid configuration
   3  annotation completed and outputs were written, but one or more items failed inference
+  4  split-history conflict: nothing in splits/ was changed (see reports/split.md)
 """
 
 
@@ -49,13 +52,28 @@ def build_parser() -> argparse.ArgumentParser:
     for stage in STAGES:
         p = sub.add_parser(stage.name, help=stage.help)
         _add_common(p)
-        p.add_argument("--force", action="store_true", help="Recompute outputs instead of reusing them")
-        p.set_defaults(handler=_cmd_stage, stage=stage.name)
+        if stage.name != "split":  # split never recomputes history; see --resplit
+            p.add_argument(
+                "--force", action="store_true", help="Recompute outputs instead of reusing them"
+            )
+        p.set_defaults(handler=_cmd_stage, stage=stage.name, force=False)
         if stage.name == "annotate":
             p.add_argument(
                 "--limit", type=int, default=None,
                 help="Only annotate the first N eligible items (by item_id), e.g. for smoke tests",
             )
+        if stage.name == "split":
+            p.add_argument(
+                "--dry-run", action="store_true", help="Compute and report; write nothing"
+            )
+            p.add_argument(
+                "--resplit",
+                action="store_true",
+                help="Deliberately rebuild ALL assignments from scratch (previews unless "
+                "--confirm matches the current history token). Never used by prepare.",
+            )
+            p.add_argument("--reason", default=None, help="Required with --resplit")
+            p.add_argument("--confirm", default=None, metavar="TOKEN", help="Resplit token")
 
     p = sub.add_parser("show-config", help="Print the fully resolved configuration")
     _add_common(p)
@@ -73,7 +91,30 @@ def _cmd_stage(cfg: PipelineConfig, args: argparse.Namespace) -> int:
         if args.limit is not None and args.limit < 1:
             raise SystemExit("error: --limit must be >= 1")
         return exit_code_of(run_annotate(cfg, force=args.force, limit=args.limit))
+    if args.stage == "split":
+        if (args.reason or args.confirm) and not args.resplit:
+            raise SystemExit("error: --reason/--confirm are only valid with --resplit")
+        result = run_split(
+            cfg,
+            dry_run=args.dry_run,
+            resplit=args.resplit,
+            reason=args.reason,
+            confirm=args.confirm,
+        )
+        if result.resplit_token is not None and not result.written:
+            _print_resplit_preview(result)
+        return result.exit_code
     return exit_code_of(get_stage(args.stage).run(cfg, args.force))
+
+
+def _print_resplit_preview(result) -> None:  # type: ignore[no-untyped-def]
+    report = result.report
+    print("RESPLIT PREVIEW — nothing has been written.")
+    for key, value in (report.get("resplit_movement") or {}).items():
+        print(f"  {key}: {value} items")
+    for w in report.get("warnings", []):
+        print(f"  WARNING: {w}")
+    print(f"To apply, re-run with: --resplit --reason \"...\" --confirm {result.resplit_token}")
 
 
 def _cmd_show_config(cfg: PipelineConfig, args: argparse.Namespace) -> int:
@@ -99,7 +140,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         return args.handler(cfg, args)
-    except (FileNotFoundError, AnnotationSetupError) as exc:
+    except ConfigError as exc:
+        logger.error(str(exc))
+        return 2
+    except (
+        FileNotFoundError,
+        AnnotationSetupError,
+        DatasetStateError,
+        SplitHistoryError,
+        SplitError,
+    ) as exc:
         logger.error(str(exc))
         return 1
     except KeyboardInterrupt:
