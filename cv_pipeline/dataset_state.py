@@ -1,10 +1,12 @@
 """Validated view of the current dataset state (ingest + dedup), shared by later stages.
 
-Splitting (and later export) depend only on *which items exist, how they are grouped, and
-which file content they refer to* — never on machine predictions. This module checks that
-``items.csv`` and ``dedup.csv`` agree with each other, with the current dedup config and
-with the files actually on disk, and builds a deterministic snapshot fingerprint of the
-result.
+Annotation, splitting (and later export) all start from :func:`load_dataset_state`, so they
+agree on whether the current state is usable. It checks that ``items.csv`` and
+``dedup.csv`` agree with each other, with the current dedup config, and (via the dedup hash
+cache) with the file content ``items.csv`` currently references.
+
+Splitting depends only on *which items exist, how they are grouped, and which file content
+they refer to* — never on machine predictions — and fingerprints exactly that.
 """
 
 from __future__ import annotations
@@ -14,10 +16,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from cv_pipeline.annotation.identity import digest
 from cv_pipeline.config import PipelineConfig
 from cv_pipeline.dedup.report import dedup_settings
 from cv_pipeline.manifest import DedupRecord, ImageHashRecord, ItemRecord, read_records
+from cv_pipeline.utils.fingerprint import digest
 from cv_pipeline.workspace import Workspace
 
 SPLIT_INPUT_SCHEMA = "cvp-split-input-v1"
@@ -55,7 +57,19 @@ def snapshot_fingerprint(rows: list[SplitInputRow] | tuple[SplitInputRow, ...]) 
     return digest({"schema": SPLIT_INPUT_SCHEMA, "items": [asdict(r) for r in rows]})
 
 
-def load_split_input(cfg: PipelineConfig) -> SplitInput:
+@dataclass(frozen=True)
+class DatasetState:
+    items: dict[str, ItemRecord]
+    dedup: dict[str, DedupRecord]
+    eligible_ids: tuple[str, ...]  # not excluded by dedup, sorted
+
+    @property
+    def excluded(self) -> int:
+        return len(self.items) - len(self.eligible_ids)
+
+
+def load_dataset_state(cfg: PipelineConfig) -> DatasetState:
+    """Load and validate items.csv + dedup.csv; raise :class:`DatasetStateError` if stale."""
     ws = Workspace(cfg.workspace_dir)
     for path, stage in ((ws.items_manifest, "ingest"), (ws.dedup_manifest, "dedup")):
         if not path.is_file():
@@ -77,10 +91,15 @@ def load_split_input(cfg: PipelineConfig) -> SplitInput:
             f"(e.g. {mismatched[0]}) — re-run the dedup stage."
         )
 
-    settings = dedup_settings(cfg.dedup)
-    _check_dedup_settings(ws, settings)
+    _check_dedup_settings(ws, dedup_settings(cfg.dedup))
     _check_dedup_content(ws, cfg, items, dedup)
+    eligible = tuple(sorted(i for i in items if not dedup[i].excluded))
+    return DatasetState(items=items, dedup=dedup, eligible_ids=eligible)
 
+
+def load_split_input(cfg: PipelineConfig) -> SplitInput:
+    state = load_dataset_state(cfg)
+    items, dedup = state.items, state.dedup
     rows = tuple(
         SplitInputRow(
             item_id=i.item_id,
@@ -90,14 +109,15 @@ def load_split_input(cfg: PipelineConfig) -> SplitInput:
             split_group=dedup[i.item_id].split_group,
             file_sha256=i.sha256,
         )
-        for i in sorted(items.values(), key=lambda r: r.item_id)
-        if not dedup[i.item_id].excluded
+        for i in (items[iid] for iid in state.eligible_ids)
     )
     return SplitInput(
         rows=rows,
         snapshot_fp=snapshot_fingerprint(rows),
-        dedup_settings_fp=digest({"schema": SPLIT_INPUT_SCHEMA, "dedup": settings}),
-        excluded=len(items) - len(rows),
+        dedup_settings_fp=digest(
+            {"schema": SPLIT_INPUT_SCHEMA, "dedup": dedup_settings(cfg.dedup)}
+        ),
+        excluded=state.excluded,
     )
 
 

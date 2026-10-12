@@ -17,8 +17,8 @@ import shutil
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from cv_pipeline.annotation.identity import digest
 from cv_pipeline.manifest import read_records, write_records
+from cv_pipeline.utils.fingerprint import digest
 from cv_pipeline.utils.io import atomic_write_text
 from cv_pipeline.workspace import Workspace
 

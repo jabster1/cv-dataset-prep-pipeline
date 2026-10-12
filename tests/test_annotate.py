@@ -24,6 +24,7 @@ from cv_pipeline.annotation.schema import (
 )
 from cv_pipeline.cli import main
 from cv_pipeline.config import ConfigError, load_config
+from cv_pipeline.dataset_state import DatasetStateError
 from cv_pipeline.dedup import run_dedup
 from cv_pipeline.ingest import run_ingest
 from cv_pipeline.manifest import ItemRecord, read_records
@@ -531,12 +532,12 @@ def test_requires_current_dedup(proj) -> None:
     save(proj.raw / "a.png", scene(1))
     cfg = proj.config()
     run_ingest(cfg)
-    with pytest.raises(FileNotFoundError, match="dedup"):
+    with pytest.raises(DatasetStateError, match="run the dedup stage first"):
         run_annotate(cfg)
     run_dedup(cfg)
     save(proj.raw / "b.png", scene(2))
     run_ingest(cfg)
-    with pytest.raises(FileNotFoundError, match="re-run the dedup stage"):
+    with pytest.raises(DatasetStateError, match="re-run the dedup stage"):
         run_annotate(cfg)
 
 

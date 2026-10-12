@@ -19,24 +19,22 @@ always denotes the same bytes and completed runs never need to be rewritten.
 from __future__ import annotations
 
 import hashlib
-import json
-from typing import Any
 
 import numpy as np
 
 from cv_pipeline.annotation.schema import SCHEMA_VERSION
+from cv_pipeline.utils.fingerprint import canonical_json, digest
+
+__all__ = [
+    "PIXEL_HASH_VERSION",
+    "canonical_json",
+    "combine",
+    "digest",
+    "input_pixel_sha256",
+    "make_run_id",
+]
 
 PIXEL_HASH_VERSION = "cvp-input-pixels-v1"
-
-
-def canonical_json(obj: Any) -> bytes:
-    return json.dumps(
-        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
-    ).encode("ascii")
-
-
-def digest(obj: Any) -> str:
-    return hashlib.sha256(canonical_json(obj)).hexdigest()
 
 
 def input_pixel_sha256(image: np.ndarray) -> str:

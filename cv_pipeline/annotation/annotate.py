@@ -63,7 +63,8 @@ from cv_pipeline.annotation.schema import (
     canonical_detections,
 )
 from cv_pipeline.config import PipelineConfig
-from cv_pipeline.manifest import DedupRecord, ItemRecord, read_records, write_records
+from cv_pipeline.dataset_state import load_dataset_state
+from cv_pipeline.manifest import ItemRecord, write_records
 from cv_pipeline.utils.hashing import sha256_bytes
 from cv_pipeline.utils.io import atomic_write_json, atomic_write_text, decode_image
 from cv_pipeline.utils.logging import get_logger, log_event
@@ -116,7 +117,7 @@ def run_annotate(
 ) -> AnnotationResult:
     t0 = time.perf_counter()
     ws = Workspace(cfg.workspace_dir).ensure()
-    items, split_groups, eligible_ids, n_excluded = _eligible_items(ws)
+    items, split_groups, eligible_ids, n_excluded = _eligible_items(cfg)
     if limit is not None:
         eligible_ids = eligible_ids[:limit]
 
@@ -246,22 +247,16 @@ def run_annotate_stage(cfg: PipelineConfig, force: bool = False) -> AnnotationRe
 
 
 def _eligible_items(
-    ws: Workspace,
+    cfg: PipelineConfig,
 ) -> tuple[dict[str, ItemRecord], dict[str, str], list[str], int]:
-    """Items, their current dedup split groups, eligible ids (sorted), excluded count."""
-    for path, stage in ((ws.items_manifest, "ingest"), (ws.dedup_manifest, "dedup")):
-        if not path.is_file():
-            raise FileNotFoundError(f"{path} not found — run the {stage} stage first.")
-    items = {r.item_id: r for r in read_records(ws.items_manifest, ItemRecord)}
-    dedup = read_records(ws.dedup_manifest, DedupRecord)
-    dedup_ids = {d.item_id for d in dedup}
-    if dedup_ids != set(items):
-        raise FileNotFoundError(
-            "dedup.csv does not match items.csv (ingest ran after dedup) — re-run the dedup stage."
-        )
-    eligible = sorted(d.item_id for d in dedup if not d.excluded)
-    split_groups = {d.item_id: d.split_group for d in dedup}
-    return items, split_groups, eligible, len(dedup) - len(eligible)
+    """Items, their current dedup split groups, eligible ids (sorted), excluded count.
+
+    Uses the same validated dataset state as splitting, so both stages agree on whether
+    the current ingest/dedup state is usable.
+    """
+    state = load_dataset_state(cfg)
+    split_groups = {iid: d.split_group for iid, d in state.dedup.items()}
+    return state.items, split_groups, list(state.eligible_ids), state.excluded
 
 
 def _check_class_mapping(info: BackendInfo, settings: PolicySettings) -> None:
