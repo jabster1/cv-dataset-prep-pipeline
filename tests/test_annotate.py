@@ -569,3 +569,111 @@ def test_raw_data_untouched(proj, scripted, tmp_path) -> None:
     run_annotate(cfg)
     run_annotate(cfg, force=True)
     assert snapshot_tree(tmp_path / "raw") == before
+
+
+# --------------------------------------------------------------------------------------
+# Split-group snapshot
+# --------------------------------------------------------------------------------------
+
+
+def test_split_group_is_snapshotted_and_changes_create_new_run(proj, scripted) -> None:
+    base = scene(7)
+    save(proj.raw / "a_base.jpg", base, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    save(proj.raw / "b_brighter.jpg", cv2.convertScaleAbs(base, beta=12))  # near-duplicate
+    save(proj.raw / "c_other.png", scene(8))
+    scripted.default = [det("square", 0.9, 1, 1, 20, 20)]
+
+    grouped = proj.prepare({"dedup": {"group_near_duplicates": True}})
+    first = run_annotate(grouped)
+    a, b, c = (proj.item_id(grouped, n) for n in ("a_base.jpg", "b_brighter.jpg", "c_other.png"))
+    groups_1 = {r.item_id: r.split_group for r in first.items}
+    assert groups_1[a] == groups_1[b] != groups_1[c]
+    assert groups_1[a].startswith("sg_")
+    on_disk = read_records(first.run_dir / "items.csv", AnnotationItemRecord)
+    assert {r.item_id: r.split_group for r in on_disk} == groups_1
+    before = run_files(first.run_dir)
+
+    # Re-running dedup with different grouping changes split_group for a and b only.
+    scripted.calls.clear()
+    ungrouped = proj.prepare({"dedup": {"group_near_duplicates": False}})
+    second = run_annotate(ungrouped)
+    groups_2 = {r.item_id: r.split_group for r in second.items}
+    assert groups_2[a] != groups_2[b]
+    assert groups_2[c] == groups_1[c]
+
+    assert second.run_id != first.run_id and second.created
+    assert scripted.calls == []  # same pixels + same model -> cached inference reused
+    assert run_files(first.run_dir) == before  # historical grouping preserved
+    assert {
+        r.item_id: r.split_group
+        for r in read_records(first.run_dir / "items.csv", AnnotationItemRecord)
+    } == groups_1
+
+
+# --------------------------------------------------------------------------------------
+# Model reference portability
+# --------------------------------------------------------------------------------------
+
+
+def test_model_reference_is_machine_independent(tmp_path) -> None:
+    from cv_pipeline.annotation.backend import model_reference
+
+    root = tmp_path / "project"
+    (root / "models").mkdir(parents=True)
+    assert model_reference("models/m.pt", root) == "models/m.pt"
+    assert model_reference(str(root / "models" / "m.pt"), root) == "models/m.pt"
+    assert model_reference("models/../models/m.pt", root) == "models/m.pt"
+    assert model_reference(str(tmp_path / "home1" / "m.pt"), root) == "external:m.pt"
+    assert model_reference(str(tmp_path / "home2" / "m.pt"), root) == "external:m.pt"
+    assert model_reference("~/anything/m.pt", root) == "external:m.pt"
+
+
+def _portable_project(base: Path, model_abs: bool, external_model: Path | None = None):
+    import yaml
+
+    from .conftest import base_config_dict
+
+    raw = base / "raw" / "images"
+    save(raw / "a.png", scene(1))
+    save(raw / "b.png", scene(2))
+    if external_model is None:
+        model = base / "models" / "m.pt"
+        model_value = str(model) if model_abs else "models/m.pt"
+    else:
+        model = external_model
+        model_value = str(model)
+    model.parent.mkdir(parents=True, exist_ok=True)
+    model.write_bytes(b"weights")
+    data = deep_update(base_config_dict(), deep_update(ANN, {"annotation": {"model": model_value}}))
+    path = base / "config.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    cfg = load_config(path)
+    run_ingest(cfg)
+    run_dedup(cfg)
+    return cfg
+
+
+def test_moving_the_project_does_not_change_run_identity(tmp_path, scripted) -> None:
+    scripted.default = [det("square", 0.9, 1, 1, 20, 20)]
+    here = run_annotate(_portable_project(tmp_path / "machine_a" / "repo", model_abs=True))
+    there = run_annotate(
+        _portable_project(tmp_path / "machine_b" / "elsewhere" / "repo", model_abs=True)
+    )
+    relative = run_annotate(_portable_project(tmp_path / "machine_c" / "repo", model_abs=False))
+    assert here.run_id == there.run_id == relative.run_id
+    assert {r.model_id for r in here.items} == {"models/m.pt"}
+    assert run_files(here.run_dir) == run_files(there.run_dir) == run_files(relative.run_dir)
+
+
+def test_external_model_location_does_not_change_run_identity(tmp_path, scripted) -> None:
+    scripted.default = [det("square", 0.9, 1, 1, 20, 20)]
+    one = run_annotate(
+        _portable_project(
+            tmp_path / "a" / "repo", True, tmp_path / "home_alice" / ".cache" / "m.pt"
+        )
+    )
+    two = run_annotate(
+        _portable_project(tmp_path / "b" / "repo", True, tmp_path / "home_bob" / "models" / "m.pt")
+    )
+    assert one.run_id == two.run_id
+    assert {r.model_id for r in one.items} == {"external:m.pt"}

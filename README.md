@@ -203,15 +203,16 @@ verified, never rewritten. `annotations/active_run.json` points to the current r
 |---|---|
 | `inference_fp` | Backend name and version, torch version, `model_sha256`, imgsz, iou, confidence floor, max detections, batch size, device, `options` |
 | `policy_fp` | Classes, `class_map`, thresholds, review settings, seed |
-| `snapshot_fp` | Ordered eligible items: `item_id`, lineage, `file_sha256`, `input_pixel_sha256`, size |
+| `snapshot_fp` | Ordered eligible items: `item_id`, lineage, `split_group` at the time of the run, `file_sha256`, `input_pixel_sha256`, size |
 | `result_digest` | Ordered per-item status, error and normalised raw detections |
-| `run_id` | `ann_` + sha256(spec = inference + policy + model_id, snapshot, result)[:16] |
+| `run_id` | `ann_` + sha256(spec = inference + policy + model reference, snapshot, result)[:16] |
 
 | Change | Effect |
 |---|---|
 | Nothing | Same `run_id`; nothing written; the model isn't even loaded |
 | New items | New run; only the new images are inferred; the old run is untouched |
 | Thresholds or `class_map` | New run; no inference (cache reused) |
+| Dedup `split_group` of an eligible item | New run; no inference (cache reused); the old run keeps its grouping |
 | Model or inference settings | New run with fresh inference |
 | `--force` | Re-infers everything. If the results are identical, the same run is reported as reproduced. If not, a new run is created and the changed items are listed. |
 | Failed items | Never cached, so they are retried on the next run |
@@ -224,6 +225,20 @@ stale predictions. `input_pixel_sha256` is
 over the `uint8` BGR result of `cv2.imdecode(..., IMREAD_COLOR)`, with EXIF orientation
 applied. The backend's own preprocessing (letterboxing, RGB conversion, scaling) happens
 after this point and is covered by `inference_fp`.
+
+Each run's `items.csv` records the `split_group` each item had when the run was created, so
+later stages never need to reconstruct historical grouping from a `dedup.csv` that may
+have changed since.
+
+**Model reference.** Run metadata stores the model as a machine-independent reference, not
+an absolute path:
+
+- A file inside the project `root` is stored root-relative, e.g. `models/loto.pt`. This is
+  the same whether the config wrote it as a relative or an absolute path.
+- A file outside the project is stored as `external:<file name>`.
+
+Moving the repository or model to another machine or home directory therefore doesn't
+change the run. What the model actually *is* comes from `model_sha256`.
 
 Hashes kept apart:
 

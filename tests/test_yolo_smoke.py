@@ -64,6 +64,7 @@ def test_yolo_backend_integration(tmp_path, write_config) -> None:
     assert {r.inference_status for r in first.items} == {InferenceStatus.OK}
     assert {r.backend for r in first.items} == {"ultralytics_yolo"}
     assert {r.model_sha256 for r in first.items} == {sha256_file(MODEL)}
+    assert {r.model_id for r in first.items} == {f"external:{MODEL.name}"}  # no abs path
     candidates = [p for p in first.predictions if p.decision == BoxDecision.CANDIDATE]
     assert {p.class_name for p in candidates} <= {"person", "vehicle"}
     assert candidates, "expected at least one mapped detection on the sample images"

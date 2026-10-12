@@ -154,6 +154,7 @@ class AnnotationItemRecord:
     source_type: str
     source_path: str
     frame_index: int | None
+    split_group: str  # dedup grouping as it was when this run was created
     image_path: str
     file_sha256: str
     input_pixel_sha256: str

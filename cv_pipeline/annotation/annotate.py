@@ -77,6 +77,7 @@ EXIT_ITEM_FAILURES = 3
 @dataclass
 class ItemOutcome:
     item: ItemRecord
+    split_group: str = ""
     status: str = InferenceStatus.OK
     error: str = ""
     file_sha256: str = ""
@@ -115,7 +116,7 @@ def run_annotate(
 ) -> AnnotationResult:
     t0 = time.perf_counter()
     ws = Workspace(cfg.workspace_dir).ensure()
-    items, eligible_ids, n_excluded = _eligible_items(ws)
+    items, split_groups, eligible_ids, n_excluded = _eligible_items(ws)
     if limit is not None:
         eligible_ids = eligible_ids[:limit]
 
@@ -138,7 +139,7 @@ def run_annotate(
         )
         cache = InferenceCache(ws.inference_cache, inference_fp)
         runner = _Runner(backend, cache, cfg.annotation.batch_size, force)
-        outcomes = runner.run([items[i] for i in eligible_ids], ws)
+        outcomes = runner.run([(items[i], split_groups[i]) for i in eligible_ids], ws)
     finally:
         backend.close()
 
@@ -244,7 +245,10 @@ def run_annotate_stage(cfg: PipelineConfig, force: bool = False) -> AnnotationRe
 # --------------------------------------------------------------------------------------
 
 
-def _eligible_items(ws: Workspace) -> tuple[dict[str, ItemRecord], list[str], int]:
+def _eligible_items(
+    ws: Workspace,
+) -> tuple[dict[str, ItemRecord], dict[str, str], list[str], int]:
+    """Items, their current dedup split groups, eligible ids (sorted), excluded count."""
     for path, stage in ((ws.items_manifest, "ingest"), (ws.dedup_manifest, "dedup")):
         if not path.is_file():
             raise FileNotFoundError(f"{path} not found — run the {stage} stage first.")
@@ -256,7 +260,8 @@ def _eligible_items(ws: Workspace) -> tuple[dict[str, ItemRecord], list[str], in
             "dedup.csv does not match items.csv (ingest ran after dedup) — re-run the dedup stage."
         )
     eligible = sorted(d.item_id for d in dedup if not d.excluded)
-    return items, eligible, len(dedup) - len(eligible)
+    split_groups = {d.item_id: d.split_group for d in dedup}
+    return items, split_groups, eligible, len(dedup) - len(eligible)
 
 
 def _check_class_mapping(info: BackendInfo, settings: PolicySettings) -> None:
@@ -294,10 +299,10 @@ class _Runner:
         self._waiters: dict[str, list[ItemOutcome]] = {}
         self._previous: dict[str, list[RawDetection] | None] = {}
 
-    def run(self, items: Sequence[ItemRecord], ws: Workspace) -> list[ItemOutcome]:
+    def run(self, items: Sequence[tuple[ItemRecord, str]], ws: Workspace) -> list[ItemOutcome]:
         outcomes = []
-        for item in items:
-            o = ItemOutcome(item)
+        for item, split_group in items:
+            o = ItemOutcome(item, split_group)
             outcomes.append(o)
             image = self._load(o, ws)
             if image is None:
@@ -393,6 +398,7 @@ def _snapshot_row(o: ItemOutcome) -> dict[str, Any]:
         "source_type": i.source_type,
         "source_path": i.source_path,
         "frame_index": i.frame_index,
+        "split_group": o.split_group,
         "image_path": i.path,
         "file_sha256": o.file_sha256,
         "input_pixel_sha256": o.pixel_sha256,
@@ -426,6 +432,7 @@ def _item_record(
         source_type=i.source_type,
         source_path=i.source_path,
         frame_index=i.frame_index,
+        split_group=o.split_group,
         image_path=i.path,
         file_sha256=o.file_sha256,
         input_pixel_sha256=o.pixel_sha256,

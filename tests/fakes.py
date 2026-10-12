@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from cv_pipeline.annotation.backend import BackendContext
+from cv_pipeline.annotation.backend import BackendContext, model_reference
 from cv_pipeline.annotation.identity import input_pixel_sha256
 from cv_pipeline.annotation.schema import BackendInfo, RawDetection
 from cv_pipeline.config import AnnotationConfig
@@ -41,13 +41,14 @@ class Script:
 class ScriptedBackend:
     def __init__(self, script: Script, cfg: AnnotationConfig, ctx: BackendContext) -> None:
         self.script, self.cfg = script, cfg
+        self.model_ref = model_reference(cfg.model, ctx.project_root) if cfg.model else "scripted"
         script.created += 1
 
     def info(self) -> BackendInfo:
         return BackendInfo(
             name="scripted",
             version=self.script.version,
-            model_id=self.cfg.model or "scripted-model",
+            model_id=self.model_ref,
             model_sha256=self.script.model_sha256,
             class_names=self.script.class_names,
             params={

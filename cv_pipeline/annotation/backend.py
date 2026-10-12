@@ -100,6 +100,26 @@ def resolve_model_path(model: str | None, project_root: Path) -> Path:
     return path.resolve()
 
 
+def model_reference(model: str, project_root: Path) -> str:
+    """Machine-independent reference to a model file, for run metadata and identity.
+
+    * inside the project root -> root-relative POSIX path, e.g. ``models/loto.pt``
+      (the same whether the config wrote it relative or absolute)
+    * outside the project root -> ``external:<file name>``, e.g. ``external:yolo11n.pt``
+
+    Absolute prefixes (home directories, checkout locations) never leak into run
+    identity. What the model *is* is identified separately by ``model_sha256``.
+    """
+    path = Path(model).expanduser()
+    if not path.is_absolute():
+        path = project_root / path
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        return f"external:{resolved.name}"
+
+
 def package_version(name: str) -> str:
     try:
         return metadata.version(name)

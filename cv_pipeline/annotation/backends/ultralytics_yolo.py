@@ -19,6 +19,7 @@ import numpy as np
 from cv_pipeline.annotation.backend import (
     AnnotationSetupError,
     BackendContext,
+    model_reference,
     package_version,
     register_backend,
     resolve_model_path,
@@ -46,6 +47,7 @@ class UltralyticsYoloBackend:
                 f"supported: {list(SUPPORTED_SUFFIXES)}"
             )
         self._model_sha = sha256_file(self._model_path)
+        self._model_ref = model_reference(str(cfg.model), ctx.project_root)
         self._meta_path = ctx.cache_dir / f"{self._model_sha}.json"
         self._model: Any = None
         self._names: tuple[str, ...] | None = None
@@ -56,7 +58,7 @@ class UltralyticsYoloBackend:
         return BackendInfo(
             name=self.name,
             version=package_version("ultralytics"),
-            model_id=str(cfg.model),
+            model_id=self._model_ref,
             model_sha256=self._model_sha,
             class_names=self._class_names(),
             params={
