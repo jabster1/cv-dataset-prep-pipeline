@@ -81,3 +81,16 @@ def snapshot_tree(root: Path) -> dict[str, tuple[int, int, str]]:
                 hashlib.sha256(p.read_bytes()).hexdigest(),
             )
     return snap
+
+
+@pytest.fixture
+def scripted():
+    """Register the deterministic ``scripted`` annotation backend for one test."""
+    from cv_pipeline.annotation.backend import register_backend, unregister_backend
+
+    from .fakes import Script, ScriptedBackend
+
+    script = Script()
+    register_backend("scripted")(lambda cfg, ctx: ScriptedBackend(script, cfg, ctx))
+    yield script
+    unregister_backend("scripted")

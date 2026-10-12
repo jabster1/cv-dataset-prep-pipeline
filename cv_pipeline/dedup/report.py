@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from typing import Any
 
-from cv_pipeline.config import PipelineConfig
+from cv_pipeline.config import DedupConfig, PipelineConfig
 from cv_pipeline.manifest import (
     DedupRecord,
     DuplicateKind,
@@ -16,6 +16,20 @@ from cv_pipeline.manifest import (
 
 REDUNDANT_VIDEO_RATIO = 0.5
 _MD_MAX_GROUPS = 200
+
+
+def dedup_settings(d: DedupConfig) -> dict[str, Any]:
+    """The dedup settings that determine dedup.csv; recorded in duplicates.json and used by
+    later stages to detect a dedup.csv that is stale relative to the current config."""
+    return {
+        "enabled": d.enabled,
+        "hash_size": d.hash_size,
+        "phash_threshold": d.near_duplicate_threshold,
+        "dhash_threshold": d.dhash_threshold,
+        "exact_duplicate_action": d.exact_duplicate_action,
+        "near_duplicate_action": d.near_duplicate_action,
+        "group_near_duplicates": d.group_near_duplicates,
+    }
 
 
 def build_report(
@@ -96,15 +110,7 @@ def build_report(
             )
 
     return {
-        "settings": {
-            "enabled": d.enabled,
-            "hash_size": d.hash_size,
-            "phash_threshold": d.near_duplicate_threshold,
-            "dhash_threshold": d.dhash_threshold,
-            "exact_duplicate_action": d.exact_duplicate_action,
-            "near_duplicate_action": d.near_duplicate_action,
-            "group_near_duplicates": d.group_near_duplicates,
-        },
+        "settings": dedup_settings(d),
         "items_analysed": len(records),
         "items_kept": len(records) - len(excluded),
         "raw_exact_duplicates": [

@@ -1,0 +1,23 @@
+# Tested development dependency combination.
+#
+#   pip install -e ".[dev]" -c constraints.txt
+#
+# Validated 2026-10-11 in a clean venv (Python 3.11.7, macOS arm64): 86 tests passing.
+# Only versions that matter for reproducibility are pinned. Torch and other
+# platform-specific packages are intentionally left to pip/Ultralytics; the annotation
+# stage records the torch version in its inference fingerprint instead.
+
+# Ultralytics requires opencv-python, albumentations/albucore require
+# opencv-python-headless. Both install the same `cv2` module, so their versions MUST match.
+opencv-python==5.0.0.93
+opencv-python-headless==5.0.0.93
+
+numpy==2.4.6
+PyYAML==6.0.3
+albumentations==2.0.8
+albucore==0.0.24
+ultralytics==8.4.175
+
+# dev extras
+pytest==9.1.1
+ruff==0.17.0

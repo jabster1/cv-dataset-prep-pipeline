@@ -7,7 +7,8 @@ names in a YAML config, and run one command.
 Nothing is project-specific: the first use case is Lockout/Tagout (LOTO) detection, but
 the same pipeline works for tools, industrial equipment, or anything else.
 
-> **Status:** Phases 1–2 of 7 are implemented (foundation, ingestion, deduplication). See
+> **Status:** Phases 1–4 of 7 are implemented (foundation, ingestion, deduplication,
+> automatic annotation, source-aware splitting). See
 > [Roadmap](#roadmap). Commands for later stages are documented as they land.
 
 ---
@@ -31,11 +32,18 @@ the same pipeline works for tools, industrial equipment, or anything else.
 Requires Python 3.11+.
 
 ```bash
-python -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+pip install -e ".[dev]" -c constraints.txt
 pytest
 ```
+
+[`constraints.txt`](constraints.txt) pins the tested combination of the dependencies that
+matter for reproducibility. It is especially important for OpenCV: Ultralytics depends on
+`opencv-python` and albumentations on `opencv-python-headless`, and both install the same
+`cv2` module, so their versions must match. Torch is left to pip and Ultralytics because
+its wheels are platform-specific. Installing without `-c constraints.txt` works but may
+resolve untested versions.
 
 ## Quick start (synthetic demo data)
 
@@ -50,16 +58,29 @@ Then look in `workspaces/example/`.
 
 | Command | What it does | Status |
 |---|---|---|
-| `python -m cv_pipeline prepare --config C` | Run every preparation stage in order | ✅ (currently: ingest → dedup) |
+| `python -m cv_pipeline prepare --config C` | Run every enabled preparation stage in order | ✅ (currently: ingest → dedup → annotate if `annotation.enabled` → split) |
 | `python -m cv_pipeline ingest --config C` | Copy images, sample video frames, write lineage manifest | ✅ |
 | `python -m cv_pipeline dedup --config C` | Exact + near-duplicate detection, split groups, duplicates report | ✅ |
+| `python -m cv_pipeline annotate --config C [--limit N]` | Pre-label eligible images with a detector; build the review queue | ✅ |
+| `python -m cv_pipeline split --config C [--dry-run]` | Source-aware train/val/test assignment that preserves history | ✅ |
+| `python -m cv_pipeline split --config C --resplit --reason TEXT [--confirm TOKEN]` | Deliberately rebuild all assignments (previews unless confirmed) | ✅ |
 | `python -m cv_pipeline show-config --config C` | Print the fully resolved config | ✅ |
-| `annotate`, `split`, `augment`, `export` | Individual stages | Phases 3–6 |
+| `augment`, `export` | Individual stages | Phases 5–6 |
 | `python -m cv_pipeline validate --config C` | Dataset checks + report | Phase 6 |
 | `python -m cv_pipeline train --config C` | Optional Ultralytics training | Phase 7 |
 
 Common flags: `--force` recomputes outputs instead of reusing them; `--log-level DEBUG`
 shows per-file detail.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | A stage could not run (missing inputs, missing or invalid model, unknown backend, ...) |
+| 2 | Invalid configuration |
+| 3 | Annotation completed and all outputs were written, but one or more items failed inference (see `reports/annotation.md`) |
+| 4 | Split-history conflict. Nothing in `splits/` was changed (see `reports/split.md`) |
 
 ## Adding images and videos
 
@@ -131,6 +152,229 @@ to catch more aggressive edits (crops, re-framing); lower them if unrelated imag
 linked. Pair search compares every pair, so cost grows with n²: about 0.6 s for 5k items
 and 8.5 s for 20k on a laptop.
 
+## Automatic annotation
+
+`annotate` pre-labels images with an existing detector so people only have to correct
+predictions instead of drawing every box. **Predictions are never treated as ground
+truth.** Every box has `provenance=machine`. An item is either `needs_review` or
+`unreviewed`, never "verified". Human review is a separate later step that records its own
+provenance.
+
+```
+dedup-eligible item ─▶ backend ─▶ RawDetection ─▶ confidence/review policy ─▶ candidates + review status
+                                                                          ─▶ immutable run snapshot ─▶ review queue
+```
+
+- **Eligible items:** items in `dedup.csv` that are not excluded, in `item_id` order.
+  Excluded duplicates are never sent to the model. `--limit N` annotates only the first N.
+- **Backends:** `backend: yolo` uses a local Ultralytics `.pt` detector. The model path is
+  only checked when annotation actually runs, and **models are never downloaded**. Other
+  detectors (an open-vocabulary model, ONNX, ...) plug in as one module that implements
+  `AnnotationBackend` and calls `register_backend("name")`. Backend-specific settings go
+  in `annotation.options`.
+- **Class mapping:** a model label maps to a project class through `class_map`, or
+  implicitly when the names are equal. Annotation refuses to start if no model class maps to
+  a project class.
+
+### Confidence and review policy
+
+Per box (first matching rule wins), all recorded in `predictions.csv`:
+
+| Rule | Decision |
+|---|---|
+| Not finite, or zero area after clipping to the image | `discarded_invalid_box` |
+| Label maps to no project class | `discarded_unmapped_class` |
+| `confidence < confidence_threshold` | `discarded_below_min_confidence` |
+| Otherwise | `candidate`; `review_flag` if `confidence < review_threshold` |
+
+An item goes to review (`needs_review`) for any of these reasons:
+
+- `inference_failed` or `unreadable_image`
+- `low_confidence`: any flagged candidate
+- `no_detections`: `review_empty`
+- `unmapped_class`: `review_unmapped_classes`
+- `audit_sample`: a deterministic `review_sample_rate` (default 5%) sample of otherwise
+  unflagged items, so confident predictions are still spot-checked
+
+### Run snapshots and identity
+
+Each completed run is an **immutable snapshot** in `annotations/runs/<run_id>/`. A new run
+is built in a temporary directory and renamed into place. An existing run directory is
+verified, never rewritten. `annotations/active_run.json` points to the current run.
+
+| Fingerprint | Built from |
+|---|---|
+| `inference_fp` | Backend name and version, torch version, `model_sha256`, imgsz, iou, confidence floor, max detections, batch size, device, `options` |
+| `policy_fp` | Classes, `class_map`, thresholds, review settings, seed |
+| `snapshot_fp` | Ordered eligible items: `item_id`, lineage, `split_group` at the time of the run, `file_sha256`, `input_pixel_sha256`, size |
+| `result_digest` | Ordered per-item status, error and normalised raw detections |
+| `run_id` | `ann_` + sha256(spec = inference + policy + model reference, snapshot, result)[:16] |
+
+| Change | Effect |
+|---|---|
+| Nothing | Same `run_id`; nothing written; the model isn't even loaded |
+| New items | New run; only the new images are inferred; the old run is untouched |
+| Thresholds or `class_map` | New run; no inference (cache reused) |
+| Dedup `split_group` of an eligible item | New run; no inference (cache reused); the old run keeps its grouping |
+| Model or inference settings | New run with fresh inference |
+| `--force` | Re-infers everything. If the results are identical, the same run is reported as reproduced. If not, a new run is created and the changed items are listed. |
+| Failed items | Never cached, so they are retried on the next run |
+
+The **inference cache** (`annotations/cache/inference/`) is keyed by `inference_fp` and
+`input_pixel_sha256`, the identity of the exact decoded array handed to the backend, not
+the file bytes. If a decoder change alters the pixels, the cache misses instead of serving
+stale predictions. `input_pixel_sha256` is
+`sha256(b"cvp-input-pixels-v1\n" + f"{H} {W} 3 uint8 BGR HWC C\n" + C-contiguous pixel bytes)`
+over the `uint8` BGR result of `cv2.imdecode(..., IMREAD_COLOR)`, with EXIF orientation
+applied. The backend's own preprocessing (letterboxing, RGB conversion, scaling) happens
+after this point and is covered by `inference_fp`.
+
+Each run's `items.csv` records the `split_group` each item had when the run was created, so
+later stages never need to reconstruct historical grouping from a `dedup.csv` that may
+have changed since.
+
+**Model reference.** Run metadata stores the model as a machine-independent reference, not
+an absolute path:
+
+- A file inside the project `root` is stored root-relative, e.g. `models/loto.pt`. This is
+  the same whether the config wrote it as a relative or an absolute path.
+- A file outside the project is stored as `external:<file name>`.
+
+Moving the repository or model to another machine or home directory therefore doesn't
+change the run. What the model actually *is* comes from `model_sha256`.
+
+Hashes kept apart:
+
+| Hash | What it identifies |
+|---|---|
+| `source_sha256` | The raw source file |
+| `file_sha256` | The encoded workspace image file |
+| `pixel_sha256` | Decoded pixels, used by dedup only |
+| `input_pixel_sha256` | The backend input |
+| `model_sha256` | The weights file |
+
+## Reviewing predictions
+
+`review/` is written in a layout YOLO-capable labeling tools (CVAT, Label Studio,
+Roboflow, labelImg) can open:
+
+```
+review/
+    images/<item_id>.<ext>    copies of queued images
+    labels/<item_id>.txt      machine labels as a starting point (YOLO format)
+    previews/<item_id>.jpg    green = candidate, amber = low confidence, grey = discarded
+    classes.txt               class names in id order
+    review_manifest.csv       item, source, predicted classes, min/max confidence, reasons,
+                              based_on_run_id, label_state
+```
+
+Edit labels in place. **Human edits are never overwritten:** a label file is rewritten
+only if it still holds exactly what the pipeline last wrote (tracked in
+`review/.export_state.csv`). Otherwise it is kept and marked `label_state=edited`. Nothing
+under `review/` is ever deleted.
+
+A later phase adds importing review decisions. Those will produce records with the same
+box schema, `provenance=human` and `based_on_run_id`, so dataset export can prefer
+human-reviewed labels.
+
+## Train/val/test splitting
+
+`split` assigns every eligible item to `train`, `val` or `test`. It depends only on the
+validated ingest and dedup state (`item_id`, `source_id`, `split_group`, file identity),
+**never on machine predictions**, so it works with annotation disabled, with manual
+labels, or with no labels yet. `prepare` runs it after dedup (and after annotate, when
+that's enabled).
+
+Priorities, in order:
+
+1. **Prevent leakage.** A dedup `split_group` is indivisible. All frames of a video, and
+   all near- or exact-duplicates across sources, stay in one split.
+2. **Preserve history.** A group that has been assigned keeps its split forever. Adding
+   data never reshuffles existing val or test items.
+3. **Match the requested fractions** as closely as whole groups allow. The report shows
+   requested and achieved fractions and explains any gap.
+
+**Input check.** Before splitting, the stage confirms that:
+
+- `dedup.csv` covers exactly the items in `items.csv`, with the same `source_id`s;
+- it was produced with the current dedup settings;
+- it was computed from the files currently on disk (via the dedup hash cache).
+
+If any check fails, the stage refuses to run (exit 1) and asks you to re-run dedup.
+
+The validated rows (`item_id, source_id, source_type, frame_index, split_group,
+file_sha256`) form the split-input snapshot, and its fingerprint `snapshot_fp` is recorded
+with every revision. If the active annotation run was made from exactly this state, its
+`run_id` is recorded as optional lineage. Otherwise lineage is reported as `stale` or
+`none`, and splitting still proceeds.
+
+### What happens to history
+
+| Situation | Result |
+|---|---|
+| Same group (same set of sources) | Keeps its split (`retained`; `items_changed` if, e.g., a video was re-sampled) |
+| New sources join a group whose sources were all in one split | The whole group **inherits** that split (`extended`) |
+| A historical group divides | Each part keeps the split (`regrouped`) |
+| A group disappears | Kept as `inactive` history; **restored** to its old split if it reappears |
+| A new group | Allocated (below) |
+| **A group now contains sources from different historical splits** | **Conflict**: exit 4, nothing in `splits/` is changed, `reports/split.md` explains it |
+
+**Resolving a conflict.** A targeted entry in `split.conflict_resolutions` may only name
+the **most protected** historical split (`test > val > train`):
+
+| Historical splits | Allowed resolution |
+|---|---|
+| train + test | `test` |
+| train + val | `val` |
+| val + test | `test` |
+
+Any other value is rejected. An entry for a group that isn't in conflict, and wasn't
+resolved that way before, is a configuration error (exit 2). Moving held-out data toward
+training requires a full resplit.
+
+### Allocation of new groups
+
+1. New groups are placed largest first, with a seeded, stable tie-break
+   (`split.seed`, default `project.seed`).
+2. Each group goes to the split with the smallest increase in target-relative squared
+   error, `((c+n-t)² - (c-t)²) / t`. Ties prefer train, then val, then test.
+3. Splits with fraction 0 never receive groups.
+4. With `require_nonempty: true` (the default): if best-fit would leave a requested val or
+   test split empty, the smallest new groups are reserved for those splits first, as long
+   as a group remains for train.
+
+History is never moved to fill a split. When filling is impossible (too few groups, or no
+new groups), the report warns instead.
+
+### Full resplit (deliberate only)
+
+```bash
+python -m cv_pipeline split --config C --resplit --reason "dedup thresholds re-tuned"
+#   -> preview: every move (e.g. test->train: 12 items) and a confirmation token; nothing written
+python -m cv_pipeline split --config C --resplit --reason "dedup thresholds re-tuned" --confirm <token>
+```
+
+- `prepare` never resplits.
+- The token is tied to the current history, so it stops working as soon as anything
+  changes.
+- Before rewriting, the current history is archived to `splits/archive/rev_NNNN/`.
+- Moves of held-out data toward training are flagged with a loud warning.
+
+`--dry-run` computes and reports without writing anything.
+
+### Outputs
+
+| File | Role |
+|---|---|
+| `splits/groups.csv` | **Persistent history**, one row per group ever assigned: split, active/inactive status, source/item counts with set fingerprints, reason (`allocated`, `inherited`, `conflict_resolution`, `resplit`), first and last revision |
+| `splits/group_sources.csv` | **Persistent** source-level memory: `source_id → split_group, split, status`. This is what detects merges and restores reappearing data. |
+| `splits/revisions.jsonl` | **Append-only**, one line per revision that changed anything: mode, `snapshot_fp`, dedup settings fingerprint, annotation lineage, split config, change counts, applied resolutions, resplit details, and a `state_digest` that is checked on every load |
+| `splits/items.csv` | **Current materialised view**: `item_id, source_id, source_type, split_group, split, reason, assigned_in_revision` |
+| `reports/split.json` / `.md` | Requested vs achieved, why they differ, changes, warnings, conflicts |
+
+The outputs are deterministic: the same snapshot, history and config give byte-identical
+files, whatever the row or filesystem order.
+
 ## Configuration
 
 See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
@@ -143,8 +387,9 @@ See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
 | `classes` | Class names in YOLO id order |
 | `ingest` | `raw_dir`, accepted extensions, video sampling |
 | `dedup` | Hash size, pHash/dHash thresholds, exact/near-duplicate actions, grouping for splits |
-| `annotation` | Backend (`yolo`), `model`, confidence / review thresholds, `class_map` |
-| `split` | `train` / `val` / `test` fractions (must sum to 1) |
+| `annotation` | Backend (`yolo`), `model`, thresholds, batch size, `class_map`, review triggers, audit sample rate, backend `options` |
+| `review` | Which items to export (`flagged` / `all`), copy images, draw previews |
+| `split` | `train` / `val` / `test` fractions (sum to 1; val/test may be 0), tie-break `seed`, `require_nonempty`, `conflict_resolutions` |
 | `augmentation` | Copies per **train** image, transforms and their probabilities |
 | `training` | Ultralytics model, epochs, imgsz, batch, device, patience |
 
@@ -158,9 +403,9 @@ manifest from the workspace and writes its own, so stages can be run (and debugg
 individually, and `prepare` is just "run them in order".
 
 ```
-raw/ ──ingest──▶ items.csv ──dedup──▶ duplicates.csv ──annotate──▶ labels/ + review/
-                                                                        │ (human review)
-dataset/ ◀──export── augmentations.csv ◀──augment (train only)── splits.csv ◀──split──┘
+raw/ ──ingest──▶ items.csv ──dedup──▶ dedup.csv ──annotate──▶ annotations/ + review/
+                                                                       │ (human review)
+dataset/ ◀──export── augmentations.csv ◀──augment (train only)── splits/ ◀──split──┘
    │
    └──validate──▶ reports/validation.{json,md}            train ──▶ runs/   (separate)
 ```
@@ -175,6 +420,10 @@ cv_pipeline/
     synthetic.py     synthetic scenes/videos for tests and demos
     ingest/          image copy + video frame sampling
     dedup/           perceptual/pixel hashing, pair search, grouping, duplicates report
+    annotation/      backend protocol + registry, YOLO backend, policy, identities, cache,
+                     immutable run snapshots, review queue, previews, report
+    dataset_state.py validated ingest/dedup state + split-input snapshot fingerprint
+    splitting/       history, reconciliation, deterministic allocation, split report
     utils/           structured logging, hashing, atomic file I/O
 configs/             example.yaml, loto.example.yaml
 examples/            make_synthetic_raw.py
@@ -193,13 +442,27 @@ tests/
         dedup.csv             per-item duplicate status + split_group
         duplicate_pairs.csv   linked pairs with kind and distances
         image_hashes.csv      hash cache
+    annotations/
+        active_run.json       pointer to the current run (mutable)
+        runs/<run_id>/        immutable: run.json, items.csv, predictions.csv, labels/
+        cache/inference/      raw detections by (inference_fp, input_pixel_sha256)
+        cache/models/         model class names by model sha256
+    review/                   review queue (see "Reviewing predictions")
+    splits/
+        groups.csv            persistent group assignments (active + inactive)
+        group_sources.csv     persistent source-level assignment memory
+        revisions.jsonl       append-only revision log
+        items.csv             current item -> split view
+        archive/rev_NNNN/     history before each deliberate resplit
     reports/
         ingest_summary.json
         duplicates.json / duplicates.md
+        annotation.json / annotation.md
+        split.json / split.md
     logs/pipeline.jsonl       structured JSON-lines log of every run
 ```
 
-Later phases add `labels/`, `review/`, `dataset/`, `runs/` and more manifests.
+Later phases add `dataset/`, `runs/` and more manifests.
 
 ### Lineage fields (`items.csv`)
 
@@ -221,8 +484,8 @@ Later phases add `labels/`, `review/`, `dataset/`, `runs/` and more manifests.
 |---|---|---|
 | 1 | Foundation, config, logging, manifests, ingestion (images + videos), CLI, tests | ✅ |
 | 2 | Exact + perceptual-hash near-duplicate detection, duplicates report | ✅ |
-| 3 | Pluggable annotation (YOLO backend), previews, review queue + manifest, label import/export | ⏳ |
-| 4 | Source-grouped deterministic train/val/test split, persistent split manifest | ⏳ |
+| 3 | Pluggable annotation (YOLO backend), confidence/review policy, immutable run snapshots, review queue | ✅ |
+| 4 | Source-aware deterministic train/val/test split with persistent history, conflict handling and deliberate resplit | ✅ |
 | 5 | Albumentations augmentation of train only, bbox-safe, lineage | ⏳ |
 | 6 | YOLO dataset export + `dataset.yaml`, validation checks, JSON + Markdown report | ⏳ |
 | 7 | Optional `train` command, end-to-end test, full documentation | ⏳ |
@@ -234,4 +497,16 @@ pytest
 ```
 
 Tests generate a tiny synthetic dataset (images in jpg/png/webp, videos in mp4/mov) in a
-temp directory — no real data needed.
+temp directory, so no real data is needed. Annotation tests use a deterministic scripted
+backend, so no model is needed either.
+
+There is also an optional Ultralytics integration smoke test, skipped by default. It
+checks loading, schema, caching and CPU determinism with a stock COCO model. **It does not
+measure annotation quality for any project.**
+
+```bash
+mkdir -p ~/.cache/cv-pipeline-smoke
+curl -L -o ~/.cache/cv-pipeline-smoke/yolo11n.pt \
+  https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt
+CV_PIPELINE_SMOKE_MODEL=~/.cache/cv-pipeline-smoke/yolo11n.pt pytest tests/test_yolo_smoke.py
+```

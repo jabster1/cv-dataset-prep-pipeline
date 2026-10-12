@@ -45,21 +45,43 @@ dedup:
   # Similar frames from the SAME video are never linked or excluded (reported only).
 
 annotation:
-  enabled: false                  # the synthetic demo has no detector; enable for real data
-  backend: yolo
-  model: null                     # e.g. models/my_detector.pt
-  confidence_threshold: 0.25      # detections below this are discarded
-  review_threshold: 0.5           # detections below this send the image to review
+  enabled: false                  # prepare runs annotate only when true; the synthetic demo
+                                  # has no detector for its shapes
+  backend: yolo                   # registered backend name
+  model: null                     # e.g. models/my_detector.pt — checked only when annotate
+                                  # runs; models are never downloaded automatically
+  confidence_threshold: 0.25      # boxes below this are discarded (still recorded for audit)
+  review_threshold: 0.5           # candidate boxes below this send the item to review
+  inference_confidence_floor: 0.05  # lowest confidence requested from the model (audit trail)
   iou_threshold: 0.7
   imgsz: 640
+  batch_size: 1                   # 1 keeps results independent of batch composition
+  max_detections: 300
   device: null                    # null = auto, or "cpu", "0", "mps"
-  class_map: {}                   # model class name -> project class name
-  review_empty: true              # images with no detections go to review
+  class_map: {}                   # model label -> project class (same names map implicitly)
+  review_empty: true              # items with no candidate boxes go to review
+  review_unmapped_classes: false  # items with boxes of unmapped model classes go to review
+  review_sample_rate: 0.05        # deterministic audit sample of otherwise-unflagged items
+  options: {}                     # backend-specific, e.g. {agnostic_nms: true}
+
+review:
+  export: flagged                 # flagged | all — which items go to review/
+  copy_images: true               # copy images into review/images for labeling tools
+  previews: true                  # draw predictions into review/previews
 
 split:
+  # Fractions of items (they must sum to 1; val/test may be 0). Split groups from dedup are
+  # indivisible, so achieved fractions can deviate; the report explains how and why.
   train: 0.7
   val: 0.2
   test: 0.1
+  seed: null                      # tie-break seed for NEW groups; null = project.seed
+  require_nonempty: true          # give every requested split at least one new group if possible
+  # Assignments persist: existing groups never move. If later grouping merges groups that
+  # were assigned to different splits, `split` stops (exit 4). A targeted fix may only keep
+  # the most protected historical split (test > val > train), e.g. {sg_3fa9c0e1b2d4: test}.
+  # Anything else requires `split --resplit` (preview, reason, confirmation token).
+  conflict_resolutions: {}
 
 augmentation:
   enabled: true

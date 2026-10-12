@@ -47,19 +47,39 @@ dedup:
 annotation:
   enabled: true
   backend: yolo
-  model: models/loto_bootstrap.pt # an existing detector used to pre-label
+  model: models/loto_bootstrap.pt # an existing detector used to pre-label (never downloaded)
   confidence_threshold: 0.25
   review_threshold: 0.6
+  inference_confidence_floor: 0.05
   iou_threshold: 0.7
   imgsz: 960                      # small objects (tags, hasps) benefit from higher res
+  batch_size: 1
+  max_detections: 300
   device: null
-  class_map: {}                   # e.g. {"lock": padlock} if model names differ
+  class_map: {}                   # e.g. {lock: padlock} if model names differ
   review_empty: true
+  review_unmapped_classes: false
+  review_sample_rate: 0.05
+  options: {}
+
+review:
+  export: flagged
+  copy_images: true
+  previews: true
 
 split:
+  # Fractions of items (they must sum to 1; val/test may be 0). Split groups from dedup are
+  # indivisible, so achieved fractions can deviate; the report explains how and why.
   train: 0.7
   val: 0.2
   test: 0.1
+  seed: null                      # tie-break seed for NEW groups; null = project.seed
+  require_nonempty: true          # give every requested split at least one new group if possible
+  # Assignments persist: existing groups never move. If later grouping merges groups that
+  # were assigned to different splits, `split` stops (exit 4). A targeted fix may only keep
+  # the most protected historical split (test > val > train), e.g. {sg_3fa9c0e1b2d4: test}.
+  # Anything else requires `split --resplit` (preview, reason, confirmation token).
+  conflict_resolutions: {}
 
 augmentation:
   enabled: true
