@@ -35,9 +35,14 @@ ingest:
 
 dedup:
   enabled: true
-  hash_size: 8
-  near_duplicate_threshold: 6
-  group_near_duplicates: true
+  hash_size: 8                    # perceptual hashes are hash_size^2 bits
+  near_duplicate_threshold: 6     # max pHash Hamming distance for a near-duplicate
+  dhash_threshold: 10             # AND max dHash distance (null = pHash only)
+  exact_duplicate_action: exclude # exclude | keep — byte/pixel-identical copies
+  near_duplicate_action: keep     # keep | exclude — cross-source near-duplicates
+  group_near_duplicates: true     # keep near-duplicates in the same split
+  # Nothing is ever deleted: "exclude" only marks items in manifests/dedup.csv.
+  # Similar frames from the SAME video are never linked or excluded (reported only).
 
 annotation:
   enabled: true

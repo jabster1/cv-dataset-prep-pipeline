@@ -32,9 +32,21 @@ class SyntheticBox:
 
 
 def _background(rng: np.random.Generator, width: int, height: int) -> np.ndarray:
-    base = rng.integers(60, 200, size=3)
-    ramp = np.linspace(-40, 40, width, dtype=np.float32)[None, :, None]
-    img = np.broadcast_to(base[None, None, :].astype(np.float32), (height, width, 3)) + ramp
+    """Gradient in a random direction + soft blobs + sensor-like noise.
+
+    Varying the low-frequency structure matters: perceptual hashes are dominated by it, so
+    identical gradients would make unrelated synthetic scenes look like near-duplicates.
+    """
+    base = rng.integers(60, 200, size=3).astype(np.float32)
+    angle = rng.uniform(0, 2 * np.pi)
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    ramp = (np.cos(angle) * (xx / width - 0.5) + np.sin(angle) * (yy / height - 0.5)) * 80
+    img = base[None, None, :] + ramp[:, :, None]
+    for _ in range(int(rng.integers(2, 5))):
+        cx, cy = rng.uniform(0, width), rng.uniform(0, height)
+        sigma = rng.uniform(0.1, 0.3) * min(width, height)
+        blob = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma**2))
+        img += blob[:, :, None] * rng.uniform(-60, 60, size=3)[None, None, :]
     img = img + rng.normal(0, 6, size=(height, width, 3))
     return np.clip(img, 0, 255).astype(np.uint8)
 

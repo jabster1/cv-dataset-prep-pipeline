@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from cv_pipeline.config import PipelineConfig
+from cv_pipeline.dedup import run_dedup
 from cv_pipeline.ingest import run_ingest
 from cv_pipeline.utils.logging import get_logger, log_event
 
@@ -25,9 +26,10 @@ class Stage:
 
 
 # Order matters: ``prepare`` runs these top to bottom. Later phases append
-# dedup -> annotate -> split -> augment -> export.
+# annotate -> split -> augment -> export.
 STAGES: list[Stage] = [
     Stage("ingest", "Copy images and sample video frames into the workspace", run_ingest),
+    Stage("dedup", "Find exact and near-duplicate images; assign split groups", run_dedup),
 ]
 
 

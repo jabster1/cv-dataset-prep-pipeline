@@ -65,6 +65,58 @@ class RejectReason:
     EXACT_DUPLICATE = "exact_duplicate"
 
 
+@dataclass
+class ImageHashRecord:
+    """Cache of per-file hashes, keyed by (sha256, hash_size)."""
+
+    sha256: str
+    hash_size: int
+    phash: str
+    dhash: str
+    pixel_sha256: str
+
+
+class DuplicateKind:
+    BYTE_IDENTICAL = "byte_identical"
+    PIXEL_IDENTICAL = "pixel_identical"
+    NEAR_DUPLICATE = "near_duplicate"
+
+
+@dataclass
+class DuplicatePairRecord:
+    """A linked pair of items. Same-source near-duplicates (e.g. adjacent video frames)
+    are deliberately not listed — they are summarised per source in the report."""
+
+    item_a: str
+    item_b: str
+    kind: str  # DuplicateKind
+    phash_distance: int
+    dhash_distance: int
+    same_source: bool
+
+
+class ExcludeReason:
+    EXACT_DUPLICATE = "exact_duplicate"
+    NEAR_DUPLICATE = "near_duplicate"
+
+
+@dataclass
+class DedupRecord:
+    """Dedup outcome for one item. ``excluded`` items stay on disk and in ``items.csv``;
+    later stages skip them. ``split_group`` is the unit the splitter assigns to a split."""
+
+    item_id: str
+    source_id: str
+    split_group: str
+    phash: str
+    dhash: str
+    pixel_sha256: str
+    dup_group: str | None = None
+    excluded: bool = False
+    exclude_reason: str | None = None  # ExcludeReason
+    duplicate_of: str | None = None
+
+
 def write_records(path: Path, records: Iterable[T], cls: type[T]) -> int:
     names = [f.name for f in fields(cls)]  # type: ignore[arg-type]
     count = 0

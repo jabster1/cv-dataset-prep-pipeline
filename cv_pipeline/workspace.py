@@ -55,6 +55,18 @@ class Workspace:
         return self.manifests / "rejected.csv"
 
     @property
+    def dedup_manifest(self) -> Path:
+        return self.manifests / "dedup.csv"
+
+    @property
+    def duplicate_pairs_manifest(self) -> Path:
+        return self.manifests / "duplicate_pairs.csv"
+
+    @property
+    def image_hash_cache(self) -> Path:
+        return self.manifests / "image_hashes.csv"
+
+    @property
     def resolved_config(self) -> Path:
         return self.root / "config.resolved.yaml"
 
