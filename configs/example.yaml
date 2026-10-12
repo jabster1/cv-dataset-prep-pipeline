@@ -1,0 +1,72 @@
+# Example pipeline config — works out of the box with the synthetic demo data:
+#
+#   python examples/make_synthetic_raw.py
+#   python -m cv_pipeline prepare --config configs/example.yaml
+#
+# Relative paths below are resolved against `root`, which is itself relative to THIS
+# file's directory. `root: ..` therefore means "the repository root".
+
+root: ..
+log_level: INFO
+
+project:
+  name: example
+  workspace: workspaces/example   # every generated file goes here
+  seed: 42                        # drives all randomness (splits, augmentation)
+
+# Class names, in YOLO class-id order. Written verbatim into dataset.yaml.
+classes:
+  - square
+  - circle
+  - triangle
+
+ingest:
+  raw_dir: data/example/raw       # read-only; recommended layout: raw/images, raw/videos
+  image_extensions: [.jpg, .jpeg, .png, .webp]
+  video_extensions: [.mp4, .mov]
+  video:
+    mode: fps                     # fps | every_n_frames
+    fps: 2.0                      # used when mode=fps
+    every_n_frames: 15            # used when mode=every_n_frames
+    max_frames: 50                # per video; null = no limit
+    max_frames_strategy: uniform  # uniform (spread across video) | first
+    image_format: jpg             # jpg | png
+    jpeg_quality: 95
+
+dedup:
+  enabled: true
+  hash_size: 8                    # perceptual hash is hash_size^2 bits
+  near_duplicate_threshold: 6     # max Hamming distance to count as near-duplicate
+  group_near_duplicates: true     # keep near-duplicates in the same split
+
+annotation:
+  enabled: false                  # the synthetic demo has no detector; enable for real data
+  backend: yolo
+  model: null                     # e.g. models/my_detector.pt
+  confidence_threshold: 0.25      # detections below this are discarded
+  review_threshold: 0.5           # detections below this send the image to review
+  iou_threshold: 0.7
+  imgsz: 640
+  device: null                    # null = auto, or "cpu", "0", "mps"
+  class_map: {}                   # model class name -> project class name
+  review_empty: true              # images with no detections go to review
+
+split:
+  train: 0.7
+  val: 0.2
+  test: 0.1
+
+augmentation:
+  enabled: true
+  copies_per_image: 2             # augmented copies per TRAIN image (val/test never augmented)
+  min_visibility: 0.3             # drop boxes that are <30% visible after a transform
+  transforms: {}                  # empty = sensible defaults; see loto.example.yaml
+
+training:
+  model: yolo11n.pt
+  epochs: 50
+  imgsz: 640
+  batch: 16
+  device: null
+  patience: 20
+  runs_dir: runs                  # relative to the workspace
