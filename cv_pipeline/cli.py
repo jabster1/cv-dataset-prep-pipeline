@@ -9,13 +9,21 @@ from collections.abc import Sequence
 import yaml
 
 from cv_pipeline import __version__
+from cv_pipeline.annotation import AnnotationSetupError, run_annotate
 from cv_pipeline.config import ConfigError, PipelineConfig, load_config
-from cv_pipeline.pipeline import STAGES, get_stage, run_prepare
+from cv_pipeline.pipeline import STAGES, exit_code_of, get_stage, run_prepare
 from cv_pipeline.utils.io import atomic_write_text
 from cv_pipeline.utils.logging import get_logger, setup_logging
 from cv_pipeline.workspace import Workspace
 
 logger = get_logger("cli")
+
+EPILOG = """exit codes:
+  0  success
+  1  stage could not run (missing inputs, missing/invalid model, ...)
+  2  invalid configuration
+  3  annotation completed and outputs were written, but one or more items failed inference
+"""
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -27,6 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cv_pipeline",
         description="Turn raw images/videos into a clean, leak-free YOLO dataset.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -41,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
         _add_common(p)
         p.add_argument("--force", action="store_true", help="Recompute outputs instead of reusing them")
         p.set_defaults(handler=_cmd_stage, stage=stage.name)
+        if stage.name == "annotate":
+            p.add_argument(
+                "--limit", type=int, default=None,
+                help="Only annotate the first N eligible items (by item_id), e.g. for smoke tests",
+            )
 
     p = sub.add_parser("show-config", help="Print the fully resolved configuration")
     _add_common(p)
@@ -50,13 +65,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_prepare(cfg: PipelineConfig, args: argparse.Namespace) -> int:
-    run_prepare(cfg, force=args.force)
-    return 0
+    return run_prepare(cfg, force=args.force)
 
 
 def _cmd_stage(cfg: PipelineConfig, args: argparse.Namespace) -> int:
-    get_stage(args.stage).run(cfg, args.force)
-    return 0
+    if args.stage == "annotate":
+        if args.limit is not None and args.limit < 1:
+            raise SystemExit("error: --limit must be >= 1")
+        return exit_code_of(run_annotate(cfg, force=args.force, limit=args.limit))
+    return exit_code_of(get_stage(args.stage).run(cfg, args.force))
 
 
 def _cmd_show_config(cfg: PipelineConfig, args: argparse.Namespace) -> int:
@@ -82,7 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         return args.handler(cfg, args)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, AnnotationSetupError) as exc:
         logger.error(str(exc))
         return 1
     except KeyboardInterrupt:

@@ -73,17 +73,38 @@ class DedupConfig:
 
 @dataclass
 class AnnotationConfig:
-    enabled: bool = True
+    # ``prepare`` runs the annotate stage only when enabled; ``annotate`` always runs.
+    enabled: bool = False
     backend: str = "yolo"
+    # Weights file, resolved against ``root``. Validated only when annotation runs.
+    # Models are never downloaded implicitly.
     model: str | None = None
+    # Boxes below this are discarded from candidates (still recorded for audit).
     confidence_threshold: float = 0.25
+    # Candidates below this put their item in the review queue.
     review_threshold: float = 0.5
+    # Lowest confidence requested from the backend; must be <= confidence_threshold.
+    inference_confidence_floor: float = 0.05
     iou_threshold: float = 0.7
     imgsz: int = 640
+    batch_size: int = 1
+    max_detections: int = 300
     device: str | None = None
+    # Backend label -> project class. Labels equal to a project class map implicitly.
     class_map: dict[str, str] = field(default_factory=dict)
     review_empty: bool = True
+    review_unmapped_classes: bool = False
+    # Deterministic audit sample of otherwise-unflagged items sent to review.
+    review_sample_rate: float = 0.05
+    # Backend-specific settings (e.g. prompts for an open-vocabulary detector).
     options: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ReviewConfig:
+    export: Literal["flagged", "all"] = "flagged"
+    copy_images: bool = True
+    previews: bool = True
 
 
 @dataclass
@@ -122,6 +143,7 @@ class PipelineConfig:
     ingest: IngestConfig = field(default_factory=IngestConfig)
     dedup: DedupConfig = field(default_factory=DedupConfig)
     annotation: AnnotationConfig = field(default_factory=AnnotationConfig)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -234,18 +256,23 @@ def validate_config(cfg: PipelineConfig) -> None:
 
     # Annotation
     a = cfg.annotation
-    check(0.0 <= a.confidence_threshold <= 1.0, "annotation.confidence_threshold must be in [0, 1]")
-    check(0.0 <= a.review_threshold <= 1.0, "annotation.review_threshold must be in [0, 1]")
+    for name in ("inference_confidence_floor", "confidence_threshold", "review_threshold"):
+        check(0.0 <= getattr(a, name) <= 1.0, f"annotation.{name} must be in [0, 1]")
     check(
-        a.review_threshold >= a.confidence_threshold,
-        "annotation.review_threshold must be >= annotation.confidence_threshold",
+        a.inference_confidence_floor <= a.confidence_threshold <= a.review_threshold,
+        "annotation thresholds must satisfy inference_confidence_floor <= "
+        "confidence_threshold <= review_threshold",
     )
     check(0.0 < a.iou_threshold <= 1.0, "annotation.iou_threshold must be in (0, 1]")
     check(a.imgsz > 0, "annotation.imgsz must be > 0")
+    check(a.batch_size >= 1, "annotation.batch_size must be >= 1")
+    check(a.max_detections >= 1, "annotation.max_detections must be >= 1")
+    check(0.0 <= a.review_sample_rate <= 1.0, "annotation.review_sample_rate must be in [0, 1]")
+    check(a.backend.strip() != "", "annotation.backend must be non-empty")
     unknown_targets = sorted(set(a.class_map.values()) - set(cfg.classes))
     check(not unknown_targets, f"annotation.class_map maps to unknown classes {unknown_targets}")
-    # Backend-specific requirements (e.g. ``model`` for yolo) are checked by the backend
-    # itself, so stages that don't annotate can run with an incomplete annotation section.
+    # Backend-specific requirements (``model`` for yolo, registered backend name) are
+    # checked when annotation is invoked, so other stages run with an incomplete section.
 
     # Split
     s = cfg.split

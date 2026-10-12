@@ -26,8 +26,24 @@ class Workspace:
         return self.root / "manifests"
 
     @property
-    def labels(self) -> Path:
-        return self.root / "labels"
+    def annotations(self) -> Path:
+        return self.root / "annotations"
+
+    @property
+    def annotation_runs(self) -> Path:
+        return self.annotations / "runs"
+
+    @property
+    def inference_cache(self) -> Path:
+        return self.annotations / "cache" / "inference"
+
+    @property
+    def model_cache(self) -> Path:
+        return self.annotations / "cache" / "models"
+
+    @property
+    def active_annotation_run(self) -> Path:
+        return self.annotations / "active_run.json"
 
     @property
     def review(self) -> Path:

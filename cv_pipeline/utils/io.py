@@ -62,6 +62,18 @@ def is_relative_to(path: Path, other: Path) -> bool:
     return path.resolve().is_relative_to(other.resolve())
 
 
+def decode_image(data: bytes | np.ndarray) -> np.ndarray | None:
+    """Decode encoded image bytes to a ``uint8`` BGR ``(H, W, 3)`` array.
+
+    ``IMREAD_COLOR`` applies EXIF orientation, drops alpha and reduces 16-bit input to
+    8-bit. Returns ``None`` if the data cannot be decoded.
+    """
+    buf = np.frombuffer(data, dtype=np.uint8) if isinstance(data, bytes) else data
+    if buf.size == 0:
+        return None
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+
 def read_image(path: Path) -> np.ndarray | None:
     """Decode an image as BGR (EXIF orientation applied). Returns ``None`` if undecodable.
 
@@ -71,9 +83,7 @@ def read_image(path: Path) -> np.ndarray | None:
         data = np.fromfile(str(path), dtype=np.uint8)
     except OSError:
         return None
-    if data.size == 0:
-        return None
-    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+    return decode_image(data)
 
 
 def encode_image(image: np.ndarray, ext: str, jpeg_quality: int = 95) -> bytes:

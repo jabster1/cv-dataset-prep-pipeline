@@ -47,14 +47,25 @@ dedup:
 annotation:
   enabled: true
   backend: yolo
-  model: models/loto_bootstrap.pt # an existing detector used to pre-label
+  model: models/loto_bootstrap.pt # an existing detector used to pre-label (never downloaded)
   confidence_threshold: 0.25
   review_threshold: 0.6
+  inference_confidence_floor: 0.05
   iou_threshold: 0.7
   imgsz: 960                      # small objects (tags, hasps) benefit from higher res
+  batch_size: 1
+  max_detections: 300
   device: null
-  class_map: {}                   # e.g. {"lock": padlock} if model names differ
+  class_map: {}                   # e.g. {lock: padlock} if model names differ
   review_empty: true
+  review_unmapped_classes: false
+  review_sample_rate: 0.05
+  options: {}
+
+review:
+  export: flagged
+  copy_images: true
+  previews: true
 
 split:
   train: 0.7
