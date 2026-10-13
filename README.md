@@ -736,13 +736,44 @@ model. They get different run IDs and separate metrics.
 **Settings.** `epochs`, `imgsz`, `batch`, `device`, `workers`, `patience`, `seed`
 (default `project.seed`), `deterministic`, `cache`, `evaluate_test`, plus
 `trainer_args`, a **validated allowlist** of further Ultralytics arguments (optimizer, lr0,
-…, augmentation knobs). Anything outside the allowlist, such as `resume`, `project` or
-`data`, is a config error.
+…). Anything outside the allowlist, such as `resume`, `project` or `data`, is a config
+error.
 
-> **Ultralytics augments during training by default** (`fliplr: 0.5`, `hsv_h: 0.015`,
-> `mosaic: 1.0`). If flips or hue are semantically unsafe for your project (as for LOTO),
-> set them explicitly, e.g. `trainer_args: {fliplr: 0.0, hsv_h: 0.0}`. The effective
-> values are always recorded.
+**Who augments: `training.augmentation_policy`.**
+
+- **`pipeline_only` (default):** Phase 5 owns augmentation. Every Ultralytics train-time
+  augmentation is **explicitly** set to off, rather than left to whatever the installed
+  version defaults to:
+  - `mosaic`, `mixup`, `cutmix`, `copy_paste`, `erasing`, `close_mosaic` = 0;
+  - `fliplr` and `flipud` = 0;
+  - `hsv_h`, `hsv_s`, `hsv_v`, `bgr` = 0;
+  - `degrees`, `translate`, `scale`, `shear`, `perspective` = 0;
+  - `augmentations=[]`, which turns off Ultralytics' **built-in Albumentations step**
+    (blur, median blur, grayscale, CLAHE), active whenever `albumentations` is installed.
+
+  Normal preprocessing (letterbox resizing, normalization) is unchanged. A non-zero
+  augmentation value in `trainer_args` is a config error. If the installed Ultralytics has
+  trainer settings the pipeline doesn't know (it was validated against 8.4.175, the version
+  in `constraints.txt`), training refuses rather than assuming they're off; a different
+  version with the same settings gives a warning.
+- **`ultralytics`:** explicit opt-in to trainer-side augmentation. Ultralytics defaults
+  apply, plus any allowlisted `trainer_args`.
+
+`run.json` → `training_augmentation` records the policy, the Phase 5 augmentation run and
+every trainer-side augmentation value actually passed.
+
+**Downloads.** With `initialization.allow_download: false`, the known optional download
+paths are switched off: `amp=false` (Ultralytics' AMP check downloads a model on CUDA) and
+`plots=false` (plots may download fonts), for training and evaluation alike. Setting
+`amp: true` or `plots: true` in `trainer_args` while downloads are off is a config error.
+`run.json` → `download_policy` records the effective values.
+
+Not controlled by the pipeline, and not guaranteed offline:
+- Ultralytics' anonymous usage analytics, which follow its own `sync` setting (disable with
+  `yolo settings sync=False`);
+- helper checks outside training.
+
+With `allow_download: true`, normal Ultralytics behaviour applies.
 
 **Devices.**
 
@@ -760,7 +791,9 @@ model. They get different run IDs and separate metrics.
 run.json      status (running → completed | failed | interrupted), start/end times, export
               lineage (run ID, fingerprint, dataset snapshot, split revision, labels
               fingerprint, augmentation run, classes, mapping), initialization (reference,
-              path, sha256, mode, checkpoint classes and metadata, class check), effective
+              path, sha256, mode, checkpoint classes and metadata, class check),
+              training_augmentation (policy, Phase 5 run, every trainer-side value),
+              download_policy (amp, plots, forced values), effective
               trainer args, seed, versions, device, overrides, warnings, metrics, artifact
               manifest (path, sha256, bytes)
 config.yaml   resolved pipeline config

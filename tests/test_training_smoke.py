@@ -16,6 +16,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+import yaml
 
 from cv_pipeline.training import run_train
 from cv_pipeline.workspace import Workspace
@@ -49,7 +50,7 @@ def test_real_one_epoch_cpu_training(tmp_path, write_config, monkeypatch) -> Non
         "batch": 4,
         "device": "cpu",
         "workers": 0,
-        "trainer_args": {"plots": False},
+        "trainer_args": {},  # pipeline_only + offline defaults decide augmentation/amp/plots
     }
     cfg = env.config(deep_update(NO_AUG, {"training": training}), imports=[TRUSTED_IMPORT])
     export_dir = Workspace(cfg.workspace_dir).root / "export" / "runs" / exp
@@ -67,3 +68,26 @@ def test_real_one_epoch_cpu_training(tmp_path, write_config, monkeypatch) -> Non
     assert not (tmp_path / "runs").exists()
     assert sorted(p.relative_to(export_dir) for p in export_dir.rglob("*")) == export_files
     assert list((result.run_dir / "dataset" / "labels").glob("*.cache"))
+    # Ultralytics actually received the pipeline_only augmentation and offline settings
+    used = yaml.safe_load((result.run_dir / "ultralytics" / "train" / "args.yaml").read_text())
+    for key in (
+        "mosaic",
+        "fliplr",
+        "flipud",
+        "hsv_h",
+        "hsv_s",
+        "hsv_v",
+        "degrees",
+        "translate",
+        "scale",
+        "shear",
+        "perspective",
+        "mixup",
+        "cutmix",
+        "copy_paste",
+        "erasing",
+    ):
+        assert used[key] == 0, key
+    assert used.get("augmentations") in ([], None)
+    assert used["amp"] is False and used["plots"] is False
+    assert run["training_augmentation"]["policy"] == "pipeline_only"

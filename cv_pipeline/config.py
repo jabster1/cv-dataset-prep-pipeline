@@ -202,6 +202,9 @@ class TrainingInitConfig:
 @dataclass
 class TrainingConfig:
     initialization: TrainingInitConfig = field(default_factory=TrainingInitConfig)
+    # pipeline_only: Phase 5 owns augmentation; every Ultralytics train-time augmentation is
+    # explicitly disabled. ultralytics: explicit opt-in to trainer-side augmentation.
+    augmentation_policy: Literal["pipeline_only", "ultralytics"] = "pipeline_only"
     epochs: int = 100
     imgsz: int = 640
     batch: int = 16  # -1 = Ultralytics auto batch
@@ -214,8 +217,8 @@ class TrainingConfig:
     # Refuse exports marked incomplete_evaluation_set unless explicitly overridden.
     allow_incomplete_evaluation: bool = False
     evaluate_test: bool = True  # final evaluation of best.pt on the test split, if any
-    # Validated allowlist of further Ultralytics trainer arguments (see training/args.py),
-    # e.g. its built-in train-time augmentation (fliplr, hsv_h, mosaic, ...).
+    # Validated allowlist of further Ultralytics trainer arguments (see training/args.py).
+    # Non-zero augmentation values require augmentation_policy: ultralytics.
     trainer_args: dict[str, Any] = field(default_factory=dict)
 
 
@@ -449,7 +452,9 @@ def validate_config(cfg: PipelineConfig) -> None:
     from cv_pipeline.training.args import TrainerArgsError, validate_trainer_args
 
     try:
-        validate_trainer_args(t.trainer_args)
+        validate_trainer_args(
+            t.trainer_args, t.augmentation_policy, t.initialization.allow_download
+        )
     except TrainerArgsError as exc:
         errors.append(str(exc))
 

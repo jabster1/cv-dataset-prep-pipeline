@@ -38,6 +38,8 @@ class TrainerBackend(Protocol):
 
     def versions(self) -> dict[str, str]: ...
 
+    def trainer_defaults(self) -> dict[str, Any]: ...
+
     def device_info(self) -> dict[str, Any]: ...
 
     def download(self, model_name: str) -> Path: ...
@@ -117,6 +119,11 @@ class UltralyticsTrainer:
             "torch": _version("torch"),
             "python": platform.python_version(),
         }
+
+    def trainer_defaults(self) -> dict[str, Any]:
+        from ultralytics.cfg import get_cfg
+
+        return dict(vars(get_cfg()))
 
     def device_info(self) -> dict[str, Any]:
         import torch

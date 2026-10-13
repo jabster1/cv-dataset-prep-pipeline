@@ -129,7 +129,8 @@ training:
   initialization:
     model: models/yolo11n.pt      # local weights file (root-relative); stock names need allow_download
     mode: pretrained              # pretrained (stock COCO base, new head) | finetune (same classes)
-    allow_download: false
+    allow_download: false         # also switches off amp and plots (known download paths)
+  augmentation_policy: pipeline_only  # Phase 5 owns augmentation; Ultralytics' is disabled
   epochs: 50
   imgsz: 640
   batch: 16                       # -1 = auto
@@ -141,4 +142,4 @@ training:
   cache: none                     # none | ram | disk
   allow_incomplete_evaluation: false
   evaluate_test: true
-  trainer_args: {}                # allowlisted Ultralytics args, e.g. {fliplr: 0.0, hsv_h: 0.0}
+  trainer_args: {}                # allowlisted Ultralytics args, e.g. {lr0: 0.005, optimizer: AdamW}

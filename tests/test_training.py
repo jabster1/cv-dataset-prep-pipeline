@@ -443,7 +443,7 @@ def test_changed_inputs_create_distinct_runs(env) -> None:
     ).run_id
     seed = run_train(train_cfg(env, {"seed": 99}), exp, dry_run=True, backend=FakeTrainer()).run_id
     args = run_train(
-        train_cfg(env, {"trainer_args": {"fliplr": 0.0}}), exp, dry_run=True, backend=FakeTrainer()
+        train_cfg(env, {"trainer_args": {"lr0": 0.005}}), exp, dry_run=True, backend=FakeTrainer()
     ).run_id
     v2 = model_file(env, "base_v2.pt", b"weights-v2")  # different weights, same mode
     model = run_train(
@@ -478,7 +478,9 @@ def test_trainer_args_validation(env) -> None:
     with pytest.raises(ConfigError, match="unsupported key"):
         env.config({"training": {"trainer_args": {"project": "/tmp/x"}}})
     with pytest.raises(ConfigError, match="must be in"):
-        env.config({"training": {"trainer_args": {"fliplr": 2.0}}})
+        env.config(
+            {"training": {"augmentation_policy": "ultralytics", "trainer_args": {"fliplr": 2.0}}}
+        )
     with pytest.raises(ConfigError, match="must be one of"):
         env.config({"training": {"trainer_args": {"optimizer": "Lion"}}})
     with pytest.raises(ConfigError, match="must be one of"):
@@ -508,3 +510,142 @@ def test_cli_dry_run(ready, capsys) -> None:
         cli.run_train = original
     assert code == 0 and "DRY RUN" in capsys.readouterr().out
     assert not (ws(cfg).root / "training").exists()
+
+
+# --------------------------------------------------------------------------------------
+# Augmentation ownership and download policy
+# --------------------------------------------------------------------------------------
+
+DISABLED = {
+    "mosaic": 0.0,
+    "fliplr": 0.0,
+    "flipud": 0.0,
+    "hsv_h": 0.0,
+    "hsv_s": 0.0,
+    "hsv_v": 0.0,
+    "degrees": 0.0,
+    "translate": 0.0,
+    "scale": 0.0,
+    "shear": 0.0,
+    "perspective": 0.0,
+    "mixup": 0.0,
+    "cutmix": 0.0,
+    "copy_paste": 0.0,
+    "erasing": 0.0,
+    "bgr": 0.0,
+}
+
+
+def test_pipeline_only_is_the_default(env) -> None:
+    assert env.config().training.augmentation_policy == "pipeline_only"
+
+
+def test_pipeline_only_disables_all_trainer_augmentation(ready) -> None:
+    cfg, exp = ready
+    fake = FakeTrainer()
+    result = run_train(cfg, exp, backend=fake)
+    (train,) = fake.called("train")
+    passed = train["args"]
+    for key, value in DISABLED.items():
+        assert passed[key] == value, key  # mosaic, flips, HSV, geometry, mixing, erasing
+    assert passed["augmentations"] == []  # Ultralytics' built-in Albumentations step: no-op
+    run = json.loads((result.run_dir / "run.json").read_text())
+    aug = run["training_augmentation"]
+    assert aug["policy"] == "pipeline_only"
+    assert {k: aug["trainer_side_values"][k] for k in DISABLED} == DISABLED
+    assert aug["trainer_side_values"]["augmentations"] == []
+
+
+def test_phase5_augmentation_run_recorded(env) -> None:
+    from .test_export import _with_aug
+
+    cfg = setup(env)
+    balanced(cfg)
+    cfg, aug = _with_aug(env, cfg)
+    exp = run_export(cfg).run_id
+    result = run_train(train_cfg(env), exp, backend=FakeTrainer())
+    run = json.loads((result.run_dir / "run.json").read_text())
+    assert run["training_augmentation"]["phase5_augmentation_run_id"] == aug.run_id
+    assert run["export"]["augmentation_run_id"] == aug.run_id
+
+
+@pytest.mark.parametrize(
+    "arg", [{"mosaic": 1.0}, {"fliplr": 0.5}, {"hsv_s": 0.7}, {"degrees": 5.0}, {"mixup": 0.1}]
+)
+def test_conflicting_trainer_augmentation_refused(env, arg) -> None:
+    with pytest.raises(ConfigError, match="conflict with augmentation_policy: pipeline_only"):
+        env.config({"training": {"trainer_args": arg}})
+    env.config({"training": {"trainer_args": {k: 0.0 for k in arg}}})  # explicit zero is fine
+
+
+def test_explicit_ultralytics_policy_permits_configured_augmentation(env) -> None:
+    _, exp = exported(env)
+    cfg = train_cfg(
+        env, {"augmentation_policy": "ultralytics", "trainer_args": {"mosaic": 0.5, "fliplr": 0.0}}
+    )
+    fake = FakeTrainer()
+    result = run_train(cfg, exp, backend=fake)
+    (train,) = fake.called("train")
+    assert train["args"]["mosaic"] == 0.5 and train["args"]["fliplr"] == 0.0
+    assert "augmentations" not in train["args"] and "hsv_s" not in train["args"]
+    values = json.loads((result.run_dir / "run.json").read_text())["training_augmentation"]
+    assert values["policy"] == "ultralytics"
+    resolved = values["trainer_side_values"]
+    assert resolved["mosaic"] == 0.5 and resolved["hsv_s"] == 0.7  # Ultralytics default recorded
+    assert "Blur" in resolved["augmentations"]
+
+
+def test_unknown_trainer_settings_block_pipeline_only(ready, env) -> None:
+    cfg, exp = ready
+    newer = FakeTrainer(defaults={**FakeTrainer().defaults, "grid_shuffle": 0.2}, version="8.9.0")
+    with pytest.raises(TrainingSetupError, match="cannot confirm.*grid_shuffle"):
+        run_train(cfg, exp, dry_run=True, backend=newer)
+    opt_in = train_cfg(env, {"augmentation_policy": "ultralytics"})
+    assert run_train(opt_in, exp, dry_run=True, backend=newer).status == "planned"
+
+
+def test_version_drift_warns_under_pipeline_only(ready) -> None:
+    cfg, exp = ready
+    plan = run_train(cfg, exp, dry_run=True, backend=FakeTrainer(version="8.4.200")).plan
+    assert any("differs from the validated" in w for w in plan["warnings"])
+
+
+def test_downloads_disabled_switches_off_amp_and_plots(ready) -> None:
+    cfg, exp = ready
+    fake = FakeTrainer()
+    result = run_train(cfg, exp, backend=fake)
+    (train,) = fake.called("train")
+    assert train["args"]["amp"] is False and train["args"]["plots"] is False
+    assert all(c["args"]["plots"] is False for c in fake.called("evaluate"))
+    policy = json.loads((result.run_dir / "run.json").read_text())["download_policy"]
+    assert policy["allow_download"] is False
+    assert set(policy["forced"]) == {"amp", "plots"}
+    assert policy["amp"] is False and policy["plots"] is False
+    assert policy["not_guaranteed_offline"]
+
+
+def test_downloads_allowed_keeps_normal_behaviour(env) -> None:
+    _, exp = exported(env)
+    cfg = train_cfg(env, {"initialization": {"allow_download": True}})
+    fake = FakeTrainer()
+    result = run_train(cfg, exp, backend=fake)
+    (train,) = fake.called("train")
+    assert "amp" not in train["args"] and "plots" not in train["args"]  # Ultralytics defaults
+    assert all("plots" not in c["args"] for c in fake.called("evaluate"))
+    policy = json.loads((result.run_dir / "run.json").read_text())["download_policy"]
+    assert policy["forced"] == {} and policy["amp"] is True and policy["plots"] is True
+
+
+def test_download_dependent_args_conflict_when_offline(env) -> None:
+    with pytest.raises(ConfigError, match="amp: true can trigger"):
+        env.config({"training": {"trainer_args": {"amp": True}}})
+    with pytest.raises(ConfigError, match="plots: true can trigger"):
+        env.config({"training": {"trainer_args": {"plots": True}}})
+    env.config(
+        {
+            "training": {
+                "initialization": {"allow_download": True},
+                "trainer_args": {"amp": True, "plots": True},
+            }
+        }
+    )

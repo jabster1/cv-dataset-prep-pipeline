@@ -129,7 +129,10 @@ training:
     #     the deployed model's classes must be checked first — nothing is renamed silently)
     model: models/yolo11s.pt
     mode: pretrained
-    allow_download: false
+    allow_download: false         # offline: also forces amp/plots off
+  # Phase 5 (with flips and hue OFF) owns augmentation; every Ultralytics train-time
+  # augmentation (mosaic, flips, HSV, geometry, mixup, built-in Albumentations, ...) is off.
+  augmentation_policy: pipeline_only
   epochs: 150
   imgsz: 960
   batch: 8
@@ -141,6 +144,4 @@ training:
   cache: none
   allow_incomplete_evaluation: false
   evaluate_test: true
-  # Ultralytics augments during training by default (fliplr 0.5, hsv_h 0.015, mosaic 1.0).
-  # Keep flips and hue OFF for LOTO, matching the pipeline's augmentation policy.
-  trainer_args: {fliplr: 0.0, hsv_h: 0.0}
+  trainer_args: {}

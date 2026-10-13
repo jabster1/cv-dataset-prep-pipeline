@@ -32,7 +32,7 @@ import yaml
 
 from cv_pipeline import __version__
 from cv_pipeline.config import PipelineConfig
-from cv_pipeline.training.args import validate_trainer_args
+from cv_pipeline.training.args import AugmentationPolicyError, resolve_training_args
 from cv_pipeline.training.backend import (
     TrainerBackend,
     TrainingSetupError,
@@ -125,7 +125,10 @@ def check_class_compatibility(mode: str, checkpoint: list[str], export: list[str
     )
 
 
-def effective_args(cfg: PipelineConfig, device: str, seed: int) -> dict[str, Any]:
+def effective_args(
+    cfg: PipelineConfig, device: str, seed: int, backend: TrainerBackend
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
+    """(trainer args, resolved augmentation record, download record, warnings)."""
     t = cfg.training
     args: dict[str, Any] = {
         "epochs": t.epochs,
@@ -140,8 +143,15 @@ def effective_args(cfg: PipelineConfig, device: str, seed: int) -> dict[str, Any
         "pretrained": True,
         "val": True,
     }
-    args.update(validate_trainer_args(t.trainer_args))
-    return args
+    extra, augmentation, download, warnings = resolve_training_args(
+        backend.trainer_defaults(),
+        backend.versions().get("ultralytics", "unknown"),
+        t.augmentation_policy,
+        t.initialization.allow_download,
+        t.trainer_args,
+    )
+    args.update(extra)
+    return args, augmentation, download, warnings
 
 
 def _stage_dataset(export: VerifiedExport, dest: Path) -> str:
@@ -232,7 +242,11 @@ def run_train(
     dev_info = backend.device_info()
     resolved = resolve_device(requested, dev_info)
     seed = t.seed if t.seed is not None else cfg.project.seed
-    args = effective_args(cfg, resolved, seed)
+    try:
+        args, augmentation, download, arg_warnings = effective_args(cfg, resolved, seed, backend)
+    except AugmentationPolicyError as exc:
+        raise TrainingSetupError(str(exc)) from exc
+    warnings += arg_warnings
     versions = backend.versions()
 
     # 5. identity --------------------------------------------------------------------------
@@ -240,6 +254,7 @@ def run_train(
         "export_run_id": export.run_id,
         "export_fingerprint": export.fingerprint,
         "initialization": {"mode": init.mode, "model_sha256": model_sha},
+        "augmentation_policy": t.augmentation_policy,
         "trainer_args": {**args, "device": requested or "auto"},
         "evaluate_test": t.evaluate_test,
         "allow_incomplete_evaluation": t.allow_incomplete_evaluation,
@@ -278,6 +293,12 @@ def run_train(
             "resume": False,
         },
         "trainer_args": args,
+        "training_augmentation": {
+            "policy": t.augmentation_policy,
+            "phase5_augmentation_run_id": (ex_id.get("augmentation") or {}).get("run_id"),
+            "trainer_side_values": augmentation,
+        },
+        "download_policy": download,
         "seed": seed,
         "device": {"requested": requested or "auto", "resolved": resolved, **dev_info},
         "versions": {**versions, "cv_pipeline": __version__},
@@ -325,6 +346,8 @@ def run_train(
             "device": resolved,
             "workers": t.workers,
         }
+        if not t.initialization.allow_download:
+            eval_args["plots"] = False  # plots may download font assets
         metrics: dict[str, Any] = {
             "checkpoint": "weights/best.pt (selected by Ultralytics on val fitness)",
             "holdout_complete": not export.incomplete_evaluation_set,
@@ -385,6 +408,9 @@ def render_report(r: dict[str, Any]) -> str:
         f"- Initialization: {init['mode']} from `{init['reference']}` "
         f"(sha256 `{init['sha256'][:12]}`) — {init['class_check']}",
         f"- Device: {r['device']['requested']} → {r['device']['resolved']}",
+        f"- Training augmentation: {r['training_augmentation']['policy']} (Phase 5 run "
+        f"`{r['training_augmentation']['phase5_augmentation_run_id']}`); downloads "
+        f"{'allowed' if r['download_policy']['allow_download'] else 'disabled'}",
         f"- Seed: {r['seed']}; versions: {r['versions']}",
         "- Weights stay in this run; no model is promoted automatically.",
         "",

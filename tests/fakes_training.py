@@ -6,8 +6,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cv_pipeline.training.args import KNOWN_TRAINER_KEYS
 from cv_pipeline.training.backend import CheckpointInfo, TrainOutcome
 from cv_pipeline.training.coco import COCO80
+
+# Real Ultralytics 8.4.175 defaults for the settings the pipeline cares about.
+ULTRALYTICS_DEFAULTS: dict[str, Any] = {
+    **{k: None for k in KNOWN_TRAINER_KEYS},
+    "hsv_h": 0.015,
+    "hsv_s": 0.7,
+    "hsv_v": 0.4,
+    "degrees": 0.0,
+    "translate": 0.1,
+    "scale": 0.5,
+    "shear": 0.0,
+    "perspective": 0.0,
+    "flipud": 0.0,
+    "fliplr": 0.5,
+    "bgr": 0.0,
+    "mosaic": 1.0,
+    "mixup": 0.0,
+    "cutmix": 0.0,
+    "copy_paste": 0.0,
+    "erasing": 0.4,
+    "close_mosaic": 10,
+    "amp": True,
+    "plots": True,
+}
 
 METRICS = {
     "metrics/precision(B)": 0.81,
@@ -43,11 +68,16 @@ class FakeTrainer:
         }
     )
     downloads: dict[str, Path] = field(default_factory=dict)
+    defaults: dict[str, Any] = field(default_factory=lambda: dict(ULTRALYTICS_DEFAULTS))
+    version: str = "8.4.175"
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     name: str = "fake"
 
     def versions(self) -> dict[str, str]:
-        return {"ultralytics": "8.4.175", "torch": "2.14.1", "python": "3.11"}
+        return {"ultralytics": self.version, "torch": "2.14.1", "python": "3.11"}
+
+    def trainer_defaults(self) -> dict[str, Any]:
+        return dict(self.defaults)
 
     def device_info(self) -> dict[str, Any]:
         return dict(self.devices)
