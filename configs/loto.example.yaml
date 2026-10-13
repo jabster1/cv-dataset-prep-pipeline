@@ -93,20 +93,20 @@ split:
   conflict_resolutions: {}
 
 augmentation:
-  enabled: true
-  copies_per_image: 2
-  min_visibility: 0.4
-  # Conservative, realistic transforms for industrial imagery. Omitted keys are disabled.
+  enabled: false
+  label_policy: trusted_only
+  variants_per_item: 2
+  min_visibility: 0.5
+  min_box_area: 16
+  # LOTO: keep flips/rotation OFF (tag text, lever/handle position and orientation can carry
+  # meaning) and keep hue at 0 (colour-coded tags/locks).
   transforms:
     brightness_contrast: {p: 0.5, brightness_limit: 0.2, contrast_limit: 0.2}
-    exposure_gamma:      {p: 0.3, gamma_limit: [80, 120]}
-    blur:                {p: 0.15, blur_limit: 3}
-    jpeg_compression:    {p: 0.3, quality_range: [60, 95]}
+    gamma:               {enabled: true, p: 0.3, gamma_limit: [80, 120]}
+    gaussian_blur:       {p: 0.15}
+    image_compression:   {p: 0.3, quality_range: [60, 95]}
     gauss_noise:         {p: 0.2}
-    rotate:              {p: 0.3, limit: 7}
-    scale:               {p: 0.3, scale_limit: 0.15}
-    safe_crop:           {p: 0.3}
-    color_jitter:        {p: 0.3, hue: 0.03, saturation: 0.2}
+    affine:              {p: 0.4, scale: [0.85, 1.15], translate_percent: [-0.05, 0.05]}
 
 training:
   model: yolo11s.pt

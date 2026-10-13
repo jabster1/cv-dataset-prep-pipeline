@@ -7,9 +7,9 @@ names in a YAML config, and run one command.
 Nothing is project-specific: the first use case is Lockout/Tagout (LOTO) detection, but
 the same pipeline works for tools, industrial equipment, or anything else.
 
-> **Status:** Phases 1–4.5 of 7 are implemented (foundation, ingestion, deduplication,
+> **Status:** Phases 1–5 of 7 are implemented (foundation, ingestion, deduplication,
 > automatic annotation, source-aware splitting, legacy dataset import and label
-> provenance). See
+> provenance, train-only augmentation). See
 > [Roadmap](#roadmap). Commands for later stages are documented as they land.
 
 ---
@@ -59,7 +59,7 @@ Then look in `workspaces/example/`.
 
 | Command | What it does | Status |
 |---|---|---|
-| `python -m cv_pipeline prepare --config C` | Run every enabled preparation stage in order | ✅ (currently: ingest → dedup → annotate if `annotation.enabled` → split) |
+| `python -m cv_pipeline prepare --config C` | Run every enabled preparation stage in order | ✅ (currently: ingest → dedup → annotate if `annotation.enabled` → split → augment if `augmentation.enabled`) |
 | `python -m cv_pipeline ingest --config C` | Copy images, sample video frames, write lineage manifest | ✅ |
 | `python -m cv_pipeline dedup --config C` | Exact + near-duplicate detection, split groups, duplicates report | ✅ |
 | `python -m cv_pipeline annotate --config C [--limit N]` | Pre-label eligible images with a detector; build the review queue | ✅ |
@@ -68,7 +68,8 @@ Then look in `workspaces/example/`.
 | `python -m cv_pipeline import-dataset --config C --name N [--dry-run]` | Explicitly import an existing labeled YOLO/Roboflow dataset listed under `imports` | ✅ |
 | `python -m cv_pipeline labels --config C [--allow-machine-unreviewed] [--allow-imported-unverified] [--allow-machine-empty]` | Resolve each item's label with provenance (trusted human labels only by default) | ✅ |
 | `python -m cv_pipeline show-config --config C` | Print the fully resolved config | ✅ |
-| `augment`, `export` | Individual stages | Phases 5–6 |
+| `python -m cv_pipeline augment --config C [--dry-run]` | Augment trusted-labelled **train** items only | ✅ |
+| `export` | YOLO dataset export | Phase 6 |
 | `python -m cv_pipeline validate --config C` | Dataset checks + report | Phase 6 |
 | `python -m cv_pipeline train --config C` | Optional Ultralytics training | Phase 7 |
 
@@ -504,6 +505,98 @@ python -m cv_pipeline split --config C --resplit --reason "dedup thresholds re-t
 The outputs are deterministic: the same snapshot, history and config give byte-identical
 files, whatever the row or filesystem order.
 
+## Train-only augmentation
+
+`augment` creates augmented copies of **train** items whose label resolves under the
+chosen policy. Val and test items are never augmented. Every augmented image keeps full
+lineage to its parent.
+
+```
+validated dataset state + latest split revision + LabelResolver(policy)
+   │  the split snapshot must equal the label/dataset snapshot, or nothing is written
+   ▼
+train items ──usable label?──▶ eligible ──▶ variants (seeded; retried) ──▶ augmentation/runs/<run_id>/
+           └──────────────────▶ skipped (reported, never treated as background)
+```
+
+**Label policy (`augmentation.label_policy`):**
+
+- `trusted_only` (default) uses only `human_imported`, `human_reviewed_accepted` and
+  `human_reviewed_corrected` labels.
+- `allow_machine_unreviewed` is a development/POC opt-in for unreviewed machine labels. It
+  needs the annotation run to be current for this dataset state. Machine zero-detection
+  results are still not negatives unless `allow_machine_empty: true` is also set.
+- Each augmented item records the provenance of its parent's label. Machine labels are
+  never promoted to trusted.
+
+**Skipped train items** are reported by category: `label_unavailable`, `label_untrusted`
+(not reviewed, rejected, unverified import, unconfirmed empty or ignored-only),
+`label_conflict` and `annotation_failed`. A trusted human negative is valid training data
+and is augmented box-free.
+
+**Refusals (exit 1, nothing written):**
+
+- no split yet;
+- the split was made from a different dataset state (re-run `split`, and `ingest`/`dedup`
+  first if data or imports changed);
+- machine opt-in with a stale annotation run (re-run `annotate`);
+- the shared dataset-state check fails;
+- a workspace image differs from `items.csv`. Every file is re-hashed before generation,
+  and each parent again while it's read.
+
+**Bounding-box safety.** Boxes use Albumentations' YOLO format with `clip=True`,
+`min_visibility` and `min_box_area`, and are then checked to be finite, non-empty and
+inside the image.
+
+- A positive image that loses **any** box is retried. This is configurable with
+  `allow_partial_box_loss`; losing **all** boxes is never accepted.
+- Retries use deterministic seeds, up to `max_attempts`. A variant that fails every attempt
+  is recorded in `rejected.csv`; nothing silently becomes a negative.
+- Trusted negatives stay box-free.
+
+**Conservative default transforms** (generic; override per project under
+`augmentation.transforms.<name>`; always applied in this fixed order):
+
+| On by default | Off by default (opt in deliberately) |
+|---|---|
+| `brightness_contrast` (±0.15) | `horizontal_flip`: mirrors text, left/right, handle position |
+| `hue_saturation_value` (hue **0**, sat ±15, val ±10) | `rotate` (±5°): boxes grow; orientation may carry meaning |
+| `gaussian_blur` (3 px) | `gamma` |
+| `gauss_noise` (std 0.01–0.03) | `perspective` |
+| `image_compression` (quality 70–95) | `bbox_safe_crop` |
+| `affine` (scale 0.9–1.1, translate ±5%, rotation 0) | |
+
+Hue is 0 by default because colour can encode state, such as red/green indicators or
+coloured tags. Disable anything that could change what an object means in your project.
+
+**Run identity and immutability.** `run_id` covers:
+
+- the dataset `snapshot_fp`;
+- the split revision and its state digest;
+- a digest of every train item's resolved label;
+- the full resolved augmentation config (policy, variants, seed, box settings, retries,
+  every transform and its parameters, output format);
+- the versions of albumentations, albucore, opencv-python and numpy.
+
+The same inputs give byte-identical images and manifests. Changing anything creates a new
+run, and completed runs are verified and reused, never rewritten.
+
+**Outputs.** `augmentation/runs/<run_id>/` contains:
+
+- `images/` and `labels/` (YOLO);
+- `items.csv`: `aug_item_id`, parent item, `source_id`, `split_group`, `split=train`, split
+  revision, origin, Roboflow family key, label provenance, source ref and sha, parent
+  negative, seed, attempt, recipe (applied transforms and sampled parameters), input and
+  output sha256, boxes before and after;
+- `skipped.csv`, `rejected.csv` and `run.json`.
+
+`augmentation/active_run.json` points to the current run.
+`reports/augmentation.{json,md}` includes a **train-only check** (augmented parents per
+split; val and test must be 0), skip reasons, provenance, trusted negatives, machine labels
+used, transform counts, rejections, and training items by source (raw, historical import,
+Roboflow family members, generated). Augmented items never enter `items.csv`, dedup or
+split history.
+
 ## Configuration
 
 See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
@@ -520,7 +613,7 @@ See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
 | `review` | Which items to export (`flagged` / `all`), copy images, draw previews |
 | `imports` | Existing labeled datasets to import explicitly: name, path, format, trust, negatives, class map, ignored classes |
 | `split` | `train` / `val` / `test` fractions (sum to 1; val/test may be 0), tie-break `seed`, `require_nonempty`, `conflict_resolutions` |
-| `augmentation` | Copies per **train** image, transforms and their probabilities |
+| `augmentation` | Train-only: label policy, variants per item, seed, box safety (`min_visibility`, `min_box_area`, `allow_partial_box_loss`, `max_attempts`), output format, transform overrides |
 | `training` | Ultralytics model, epochs, imgsz, batch, device, patience |
 
 Loading is strict: unknown keys, wrong types, and inconsistent values (e.g. split fractions
@@ -555,6 +648,7 @@ cv_pipeline/
     dataset_state.py validated ingest/dedup state + split-input snapshot fingerprint
     imports/         YOLO/Roboflow export validation, immutable import snapshots
     labels/          provenance, review decisions, LabelResolver, labels report
+    augmentation/    transform registry, train-only augmentation runs, report
     splitting/       history, reconciliation, deterministic allocation, split report
     utils/           structured logging, hashing, atomic file I/O
 configs/             example.yaml, loto.example.yaml
@@ -578,6 +672,10 @@ tests/
     imports/<name>/           immutable import snapshots: files/, images.csv, boxes.csv,
                               rejected.csv, import.json
     labels/                   resolved.csv, boxes.csv (label resolution output)
+    augmentation/
+        active_run.json       pointer to the current augmentation run
+        runs/<run_id>/        immutable: images/, labels/, items.csv, skipped.csv,
+                              rejected.csv, run.json
     annotations/
         active_run.json       pointer to the current run (mutable)
         runs/<run_id>/        immutable: run.json, items.csv, predictions.csv, labels/
@@ -597,6 +695,7 @@ tests/
         split.json / split.md
         import_<name>.json / .md
         labels.json / labels.md
+        augmentation.json / augmentation.md
     logs/pipeline.jsonl       structured JSON-lines log of every run
 ```
 
@@ -626,7 +725,7 @@ Later phases add `dataset/`, `runs/` and more manifests.
 | 3 | Pluggable annotation (YOLO backend), confidence/review policy, immutable run snapshots, review queue | ✅ |
 | 4 | Source-aware deterministic train/val/test split with persistent history, conflict handling and deliberate resplit | ✅ |
 | 4.5 | Legacy YOLO/Roboflow import, label provenance, review decisions, trusted-label resolution | ✅ |
-| 5 | Albumentations augmentation of train only, bbox-safe, lineage, using resolved trusted labels | ⏳ |
+| 5 | Albumentations augmentation of train only, bbox-safe, lineage, using resolved trusted labels | ✅ |
 | 6 | YOLO dataset export + `dataset.yaml`, validation checks, JSON + Markdown report | ⏳ |
 | 7 | Optional `train` command, end-to-end test, full documentation | ⏳ |
 

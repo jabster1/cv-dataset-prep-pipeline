@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from cv_pipeline.annotation import run_annotate_stage
+from cv_pipeline.augmentation import run_augment_stage
 from cv_pipeline.config import PipelineConfig
 from cv_pipeline.dedup import run_dedup
 from cv_pipeline.ingest import run_ingest
@@ -38,8 +39,7 @@ def exit_code_of(result: object) -> int:
     return int(getattr(result, "exit_code", 0) or 0)
 
 
-# Order matters: ``prepare`` runs these top to bottom. Later phases append
-# augment -> export.
+# Order matters: ``prepare`` runs these top to bottom. Later phases append export.
 STAGES: list[Stage] = [
     Stage("ingest", "Copy images and sample video frames into the workspace", run_ingest),
     Stage("dedup", "Find exact and near-duplicate images; assign split groups", run_dedup),
@@ -53,6 +53,12 @@ STAGES: list[Stage] = [
         "split",
         "Assign split groups to train/val/test, preserving history (never resplits)",
         run_split_stage,
+    ),
+    Stage(
+        "augment",
+        "Augment trusted-labelled TRAIN items only (never val/test)",
+        run_augment_stage,
+        enabled=lambda cfg: cfg.augmentation.enabled,
     ),
 ]
 

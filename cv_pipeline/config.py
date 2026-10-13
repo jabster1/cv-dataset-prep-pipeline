@@ -147,9 +147,22 @@ class SplitConfig:
 
 @dataclass
 class AugmentationConfig:
-    enabled: bool = True
-    copies_per_image: int = 2
-    min_visibility: float = 0.3
+    """Train-only augmentation (see cv_pipeline/augmentation)."""
+
+    enabled: bool = False  # prepare runs augment only when true; `augment` always runs
+    # trusted_only: human_imported / human_reviewed_accepted / human_reviewed_corrected.
+    # allow_machine_unreviewed: development/POC opt-in for unreviewed machine labels.
+    label_policy: Literal["trusted_only", "allow_machine_unreviewed"] = "trusted_only"
+    allow_machine_empty: bool = False  # machine zero detections as negatives (opt-in only)
+    variants_per_item: int = 2
+    seed: int | None = None  # null -> project.seed
+    min_visibility: float = 0.5  # boxes less visible than this after a transform are lost
+    min_box_area: float = 16.0  # pixels^2; smaller boxes are lost
+    allow_partial_box_loss: bool = False  # losing ALL boxes of a positive is never allowed
+    max_attempts: int = 5  # deterministic retries per variant before it is rejected
+    image_format: Literal["jpg", "png"] = "jpg"
+    jpeg_quality: int = 95
+    # Overrides of the conservative defaults in cv_pipeline/augmentation/transforms.py
     transforms: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
@@ -355,8 +368,21 @@ def validate_config(cfg: PipelineConfig) -> None:
 
     # Augmentation
     aug = cfg.augmentation
-    check(aug.copies_per_image >= 0, "augmentation.copies_per_image must be >= 0")
+    check(aug.variants_per_item >= 1, "augmentation.variants_per_item must be >= 1")
     check(0.0 <= aug.min_visibility <= 1.0, "augmentation.min_visibility must be in [0, 1]")
+    check(aug.min_box_area >= 0, "augmentation.min_box_area must be >= 0")
+    check(aug.max_attempts >= 1, "augmentation.max_attempts must be >= 1")
+    check(1 <= aug.jpeg_quality <= 100, "augmentation.jpeg_quality must be in [1, 100]")
+    check(
+        not (aug.allow_machine_empty and aug.label_policy != "allow_machine_unreviewed"),
+        "augmentation.allow_machine_empty requires label_policy: allow_machine_unreviewed",
+    )
+    from cv_pipeline.augmentation.transforms import TransformConfigError, resolve_transforms
+
+    try:
+        resolve_transforms(aug.transforms)
+    except TransformConfigError as exc:
+        errors.append(str(exc))
 
     # Training
     t = cfg.training

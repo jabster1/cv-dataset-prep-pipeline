@@ -98,10 +98,22 @@ split:
   conflict_resolutions: {}
 
 augmentation:
-  enabled: true
-  copies_per_image: 2             # augmented copies per TRAIN image (val/test never augmented)
-  min_visibility: 0.3             # drop boxes that are <30% visible after a transform
-  transforms: {}                  # empty = sensible defaults; see loto.example.yaml
+  enabled: false                  # prepare runs `augment` only when true
+  label_policy: trusted_only      # trusted_only | allow_machine_unreviewed (dev/POC opt-in)
+  allow_machine_empty: false      # machine zero detections as negatives (opt-in only)
+  variants_per_item: 2            # augmented variants per eligible TRAIN item (val/test never)
+  seed: null                      # null -> project.seed
+  min_visibility: 0.5             # a box less visible than this after a transform is "lost"
+  min_box_area: 16                # pixels^2
+  allow_partial_box_loss: false   # positives losing any box are retried; losing all: always
+  max_attempts: 5                 # deterministic retries per variant, then rejected
+  image_format: jpg
+  jpeg_quality: 95
+  # Overrides of the conservative defaults (cv_pipeline/augmentation/transforms.py):
+  # on: brightness_contrast, hue_saturation_value (hue 0), gaussian_blur, gauss_noise,
+  #     image_compression, affine (scale/translate, no rotation)
+  # off: horizontal_flip, rotate, gamma, perspective, bbox_safe_crop
+  transforms: {}
 
 training:
   model: yolo11n.pt

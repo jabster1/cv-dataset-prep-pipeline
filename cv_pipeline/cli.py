@@ -10,6 +10,7 @@ import yaml
 
 from cv_pipeline import __version__
 from cv_pipeline.annotation import AnnotationSetupError, run_annotate
+from cv_pipeline.augmentation import AugmentationError, run_augment
 from cv_pipeline.config import ConfigError, PipelineConfig, load_config
 from cv_pipeline.dataset_state import DatasetStateError
 from cv_pipeline.imports import ImportError_, run_import
@@ -64,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
                 "--limit", type=int, default=None,
                 help="Only annotate the first N eligible items (by item_id), e.g. for smoke tests",
             )
+        if stage.name == "augment":
+            p.add_argument(
+                "--dry-run", action="store_true",
+                help="Check eligibility and compute the run identity; generate nothing",
+            )
         if stage.name == "split":
             p.add_argument(
                 "--dry-run", action="store_true", help="Compute and report; write nothing"
@@ -115,6 +121,8 @@ def _cmd_stage(cfg: PipelineConfig, args: argparse.Namespace) -> int:
         if args.limit is not None and args.limit < 1:
             raise SystemExit("error: --limit must be >= 1")
         return exit_code_of(run_annotate(cfg, force=args.force, limit=args.limit))
+    if args.stage == "augment":
+        return run_augment(cfg, dry_run=args.dry_run).exit_code
     if args.stage == "split":
         if (args.reason or args.confirm) and not args.resplit:
             raise SystemExit("error: --reason/--confirm are only valid with --resplit")
@@ -192,6 +200,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         SplitHistoryError,
         SplitError,
         ImportError_,
+        AugmentationError,
     ) as exc:
         logger.error(str(exc))
         return 1
