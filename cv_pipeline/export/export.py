@@ -603,20 +603,50 @@ def _strict_problem(coverage: dict[str, dict[str, Any]]) -> str:
     )
 
 
-def _assert_no_leakage(
-    rows: list[_Row], split_rows: dict[str, SplitItemRecord], eligible: set[str]
-) -> None:
+def manifest_leakage_problems(records: list[ExportRecord]) -> list[str]:
+    """Leakage invariants checkable from an export manifest alone (shared with training)."""
     problems = []
     seen: dict[str, dict[str, set[str]]] = {
         k: defaultdict(set) for k in ("item", "group", "source", "family")
     }
-    for r in rows:
-        rec = r.record
+    train_originals = {r.item_id for r in records if r.kind == "original" and r.split == "train"}
+    for rec in records:
         seen["item"][rec.item_id].add(rec.split)
         seen["group"][rec.split_group].add(rec.split)
         seen["source"][rec.source_id].add(rec.split)
         if rec.family_key:
             seen["family"][rec.family_key].add(rec.split)
+        if rec.kind == "augmented":
+            if rec.split != "train":
+                problems.append(f"augmented {rec.aug_item_id} outside train")
+            if rec.item_id not in train_originals:
+                problems.append(f"augmented {rec.aug_item_id} has no exported train parent")
+            if not rec.export_image.startswith("images/train/") or not rec.export_label.startswith(
+                "labels/train/"
+            ):
+                problems.append(f"augmented {rec.aug_item_id} written outside train/")
+        elif rec.kind != "original":
+            problems.append(f"unknown row kind {rec.kind!r}")
+        if rec.split != "train" and Path(rec.export_image).name.startswith("aug_"):
+            problems.append(f"augmentation file in {rec.split}: {rec.export_image}")
+        for path, sub in ((rec.export_image, "images"), (rec.export_label, "labels")):
+            if not path.startswith(f"{sub}/{rec.split}/"):
+                problems.append(f"{path} is not under {sub}/{rec.split}/")
+    for kind, mapping in seen.items():
+        for key, splits in mapping.items():
+            if len(splits) > 1:
+                problems.append(f"{kind} {key} appears in several splits {sorted(splits)}")
+    names = Counter(r.export_image for r in records)
+    problems += [f"file name collision {n}" for n, c in names.items() if c > 1]
+    return problems
+
+
+def _assert_no_leakage(
+    rows: list[_Row], split_rows: dict[str, SplitItemRecord], eligible: set[str]
+) -> None:
+    records = [r.record for r in rows]
+    problems = manifest_leakage_problems(records)
+    for rec in records:  # checks that need the workspace state
         if rec.kind == "original":
             if rec.item_id not in eligible:
                 problems.append(f"{rec.item_id} is not dedup-eligible (excluded duplicate)")
@@ -625,21 +655,8 @@ def _assert_no_leakage(
                     f"{rec.item_id} exported to {rec.split}, split history says "
                     f"{split_rows[rec.item_id].split}"
                 )
-        else:
-            if rec.split != "train" or split_rows[rec.item_id].split != "train":
-                problems.append(f"augmented {rec.aug_item_id} outside train")
-            if not rec.export_image.startswith("images/train/") or not rec.export_label.startswith(
-                "labels/train/"
-            ):
-                problems.append(f"augmented {rec.aug_item_id} written outside train/")
-        if rec.split != "train" and Path(rec.export_image).name.startswith("aug_"):
-            problems.append(f"augmentation file in {rec.split}: {rec.export_image}")
-    for kind, mapping in seen.items():
-        for key, splits in mapping.items():
-            if len(splits) > 1:
-                problems.append(f"{kind} {key} appears in several splits {sorted(splits)}")
-    names = Counter(r.record.export_image for r in rows)
-    problems += [f"file name collision {n}" for n, c in names.items() if c > 1]
+        elif split_rows[rec.item_id].split != "train":
+            problems.append(f"augmented {rec.aug_item_id} has a non-train parent")
     if problems:
         raise ExportLeakageError("Export leakage check failed:\n  " + "\n  ".join(problems[:20]))
 

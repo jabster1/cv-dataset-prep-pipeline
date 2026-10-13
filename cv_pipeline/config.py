@@ -185,15 +185,38 @@ class ExportConfig:
 
 
 @dataclass
+class TrainingInitConfig:
+    """Where the weights come from.
+
+    pretrained: standard Ultralytics base weights (stock COCO-80 detector); a new head is
+                built for the export's classes.
+    finetune:   a NEW run initialised from custom weights (e.g. best_loto.pt); checkpoint
+                classes must equal the export classes exactly. This is not ``resume``.
+    """
+
+    model: str = "yolo11n.pt"  # root-relative path; a bare stock name needs allow_download
+    mode: Literal["pretrained", "finetune"] = "pretrained"
+    allow_download: bool = False  # never fetch weights implicitly
+
+
+@dataclass
 class TrainingConfig:
-    model: str = "yolo11n.pt"
+    initialization: TrainingInitConfig = field(default_factory=TrainingInitConfig)
     epochs: int = 100
     imgsz: int = 640
-    batch: int = 16
-    device: str | None = None
+    batch: int = 16  # -1 = Ultralytics auto batch
+    device: str | None = None  # null/auto | cpu | mps | 0 | 0,1 | cuda:0
+    workers: int = 4
     patience: int = 50
-    runs_dir: Path = Path("runs")
-    extra_args: dict[str, Any] = field(default_factory=dict)
+    seed: int | None = None  # null -> project.seed
+    deterministic: bool = True
+    cache: Literal["none", "ram", "disk"] = "none"
+    # Refuse exports marked incomplete_evaluation_set unless explicitly overridden.
+    allow_incomplete_evaluation: bool = False
+    evaluate_test: bool = True  # final evaluation of best.pt on the test split, if any
+    # Validated allowlist of further Ultralytics trainer arguments (see training/args.py),
+    # e.g. its built-in train-time augmentation (fliplr, hsv_h, mosaic, ...).
+    trainer_args: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -261,8 +284,6 @@ def _resolve_paths(cfg: PipelineConfig, base_dir: Path) -> None:
     cfg.ingest.raw_dir = under_root(cfg.ingest.raw_dir)
     for imp in cfg.imports:
         imp.path = under_root(imp.path)
-    if not cfg.training.runs_dir.is_absolute():
-        cfg.training.runs_dir = (cfg.project.workspace / cfg.training.runs_dir).resolve()
 
 
 def _normalize(cfg: PipelineConfig) -> None:
@@ -423,6 +444,14 @@ def validate_config(cfg: PipelineConfig) -> None:
     check(t.imgsz > 0, "training.imgsz must be > 0")
     check(t.batch == -1 or t.batch >= 1, "training.batch must be >= 1 (or -1 for auto)")
     check(t.patience >= 0, "training.patience must be >= 0")
+    check(t.workers >= 0, "training.workers must be >= 0")
+    check(t.initialization.model.strip() != "", "training.initialization.model must be set")
+    from cv_pipeline.training.args import TrainerArgsError, validate_trainer_args
+
+    try:
+        validate_trainer_args(t.trainer_args)
+    except TrainerArgsError as exc:
+        errors.append(str(exc))
 
     if errors:
         raise ConfigError("Invalid configuration:\n  - " + "\n  - ".join(errors))

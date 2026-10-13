@@ -15,7 +15,7 @@ def test_shipped_configs_load(name: str) -> None:
     assert cfg.classes
     assert cfg.root == REPO_ROOT
     assert cfg.workspace_dir.is_relative_to(REPO_ROOT / "workspaces")
-    assert cfg.training.runs_dir.is_relative_to(cfg.workspace_dir)
+    assert cfg.training.initialization.mode in ("pretrained", "finetune")
 
 
 def test_defaults_and_normalisation(write_config) -> None:

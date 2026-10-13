@@ -126,10 +126,19 @@ export:
   non_target_classes: error       # error | drop_boxes (positives left box-free are excluded)
 
 training:
-  model: yolo11n.pt
+  initialization:
+    model: models/yolo11n.pt      # local weights file (root-relative); stock names need allow_download
+    mode: pretrained              # pretrained (stock COCO base, new head) | finetune (same classes)
+    allow_download: false
   epochs: 50
   imgsz: 640
-  batch: 16
-  device: null
+  batch: 16                       # -1 = auto
+  device: null                    # null/auto | cpu | mps | 0 | 0,1 | cuda:0
+  workers: 4
   patience: 20
-  runs_dir: runs                  # relative to the workspace
+  seed: null                      # null -> project.seed
+  deterministic: true
+  cache: none                     # none | ram | disk
+  allow_incomplete_evaluation: false
+  evaluate_test: true
+  trainer_args: {}                # allowlisted Ultralytics args, e.g. {fliplr: 0.0, hsv_h: 0.0}

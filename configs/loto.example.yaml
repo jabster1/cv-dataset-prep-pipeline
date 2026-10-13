@@ -1,9 +1,13 @@
 # Lockout/Tagout (LOTO) detection — template config.
-# Copy to configs/loto.yaml, adjust class names / model path, then:
+# Copy to configs/loto.yaml, adjust class names / model paths, then:
 #
-#   python -m cv_pipeline prepare  --config configs/loto.yaml
-#   python -m cv_pipeline validate --config configs/loto.yaml
-#   python -m cv_pipeline train    --config configs/loto.yaml
+#   python -m cv_pipeline import-dataset --config configs/loto.yaml --name <legacy export>
+#   python -m cv_pipeline prepare        --config configs/loto.yaml
+#   python -m cv_pipeline review-queue   --config configs/loto.yaml   # + review/decisions.csv
+#   python -m cv_pipeline labels         --config configs/loto.yaml
+#   python -m cv_pipeline augment        --config configs/loto.yaml
+#   python -m cv_pipeline export         --config configs/loto.yaml
+#   python -m cv_pipeline train          --config configs/loto.yaml --export-run exp_...
 #
 # Nothing in the pipeline is LOTO-specific: the same config shape works for tools,
 # industrial equipment, or any other detection project.
@@ -16,12 +20,13 @@ project:
   workspace: workspaces/loto
   seed: 1337
 
+# PLACEHOLDER taxonomy — confirm before the first real run. The deployed LOTO model uses
+# names including isolation_point, lock and loto_tag. Inspect the historical Roboflow
+# data.yaml and the deployed checkpoint, choose the canonical classes, and map any differing
+# source names explicitly (imports[].class_map). Nothing is ever renamed silently.
 classes:
-  - padlock
-  - lockout_tag
-  - hasp
-  - valve_lockout
-  - breaker_lockout
+  - lock
+  - loto_tag
 
 ingest:
   raw_dir: data/loto/raw          # data/loto/raw/images, data/loto/raw/videos
@@ -56,7 +61,7 @@ annotation:
   batch_size: 1
   max_detections: 300
   device: null
-  class_map: {}                   # e.g. {lock: padlock} if model names differ
+  class_map: {}                   # model label -> project class, only if names differ
   review_empty: true
   review_unmapped_classes: false
   review_sample_rate: 0.05
@@ -75,7 +80,7 @@ imports: []
 #    empty_labels_are_negatives: true # only if empty files really mean "reviewed, nothing here"
 #    ignored_only_labels_are_negatives: false
 #    # Prefer exporting Roboflow versions WITHOUT augmentation; the pipeline augments train only.
-#    class_map: {lock: padlock, tag: lockout_tag}
+#    class_map: {}                  # e.g. {Lock: lock} if the Roboflow names differ
 #    ignore_classes: []
 
 split:
@@ -113,14 +118,29 @@ export:
   label_policy: trusted_only
   evaluation_policy: strict
   augmentation_run: latest
-  classes: null                   # e.g. [padlock, lockout_tag] for a two-class detector
+  classes: null                   # training taxonomy subset; null = all project classes
   non_target_classes: error
 
 training:
-  model: yolo11s.pt
+  initialization:
+    # A: fresh baseline       -> model: models/yolo11s.pt,  mode: pretrained
+    # B: continue our model   -> model: models/best_loto.pt, mode: finetune
+    #    (finetune requires the checkpoint's class names/order to equal export.classes;
+    #     the deployed model's classes must be checked first — nothing is renamed silently)
+    model: models/yolo11s.pt
+    mode: pretrained
+    allow_download: false
   epochs: 150
   imgsz: 960
   batch: 8
-  device: null
+  device: null                    # set explicitly on RunPod/CUDA, e.g. "0"
+  workers: 4
   patience: 30
-  runs_dir: runs
+  seed: null
+  deterministic: true
+  cache: none
+  allow_incomplete_evaluation: false
+  evaluate_test: true
+  # Ultralytics augments during training by default (fliplr 0.5, hsv_h 0.015, mosaic 1.0).
+  # Keep flips and hue OFF for LOTO, matching the pipeline's augmentation policy.
+  trainer_args: {fliplr: 0.0, hsv_h: 0.0}

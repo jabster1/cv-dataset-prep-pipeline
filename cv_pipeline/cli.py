@@ -20,6 +20,7 @@ from cv_pipeline.labels import LabelPolicy, run_labels
 from cv_pipeline.labels.review_queue import MODES, ReviewQueueError, run_review_queue
 from cv_pipeline.pipeline import STAGES, exit_code_of, get_stage, run_prepare
 from cv_pipeline.splitting import SplitError, SplitHistoryError, run_split
+from cv_pipeline.training import ExportIntegrityError, TrainingSetupError, run_train
 from cv_pipeline.utils.io import atomic_write_text
 from cv_pipeline.utils.logging import get_logger, setup_logging
 from cv_pipeline.workspace import Workspace
@@ -138,6 +139,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--split", choices=("all", "train", "val", "test"), default="all")
     p.set_defaults(handler=_cmd_review_queue)
 
+    p = sub.add_parser(
+        "train",
+        help="Train/fine-tune YOLO from an EXPLICIT export run (never the newest by default)",
+    )
+    _add_common(p)
+    p.add_argument(
+        "--export-run",
+        required=True,
+        metavar="EXP_ID",
+        help="Export run id to train from (export/runs/<id>)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="All preflight checks; report what would train; start nothing",
+    )
+    p.add_argument(
+        "--attempt",
+        type=int,
+        default=1,
+        help="Start a new run with otherwise identical inputs (e.g. after a failure)",
+    )
+    p.add_argument("--device", default=None, help="Override training.device (cpu, mps, 0, ...)")
+    p.set_defaults(handler=_cmd_train)
+
     p = sub.add_parser("show-config", help="Print the fully resolved configuration")
     _add_common(p)
     p.set_defaults(handler=_cmd_show_config)
@@ -228,6 +254,25 @@ def _print_export_summary(report: dict) -> None:  # type: ignore[type-arg]
         print(f"  {s}: {c['exported']}/{c['total']} exported, coverage {c['coverage_pct']}%")
 
 
+def _cmd_train(cfg: PipelineConfig, args: argparse.Namespace) -> int:
+    result = run_train(
+        cfg, args.export_run, dry_run=args.dry_run, attempt=args.attempt, device=args.device
+    )
+    plan = result.plan
+    if result.status == "planned":
+        init = plan["initialization"]
+        print(f"DRY RUN — would create training run {result.run_id}")
+        print(f"  export {plan['export']['run_id']} {plan['export']['counts']}")
+        print(f"  init {init['mode']} {init['reference']} ({init['class_check']})")
+        print(f"  device {plan['device']['requested']} -> {plan['device']['resolved']}")
+        print(f"  args {plan['trainer_args']}")
+    else:
+        print(f"training run {result.run_id}: {result.status} ({result.run_dir})")
+    for w in plan.get("warnings", []):
+        print(f"  WARNING: {w}")
+    return result.exit_code
+
+
 def _cmd_show_config(cfg: PipelineConfig, args: argparse.Namespace) -> int:
     sys.stdout.write(yaml.safe_dump(cfg.to_dict(), sort_keys=False))
     return 0
@@ -267,6 +312,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         AugmentationError,
         ExportError,
         ReviewQueueError,
+        TrainingSetupError,
+        ExportIntegrityError,
     ) as exc:
         logger.error(str(exc))
         return 1

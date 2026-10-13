@@ -7,9 +7,9 @@ names in a YAML config, and run one command.
 Nothing is project-specific: the first use case is Lockout/Tagout (LOTO) detection, but
 the same pipeline works for tools, industrial equipment, or anything else.
 
-> **Status:** Phases 1–6 of 7 are implemented (foundation, ingestion, deduplication,
+> **Status:** All 7 phases are implemented (foundation, ingestion, deduplication,
 > automatic annotation, source-aware splitting, legacy dataset import and label
-> provenance, train-only augmentation, validated YOLO export). See
+> provenance, train-only augmentation, validated YOLO export, training). See
 > [Roadmap](#roadmap). Commands for later stages are documented as they land.
 
 ---
@@ -71,8 +71,7 @@ Then look in `workspaces/example/`.
 | `python -m cv_pipeline augment --config C [--dry-run]` | Augment trusted-labelled **train** items only | ✅ |
 | `python -m cv_pipeline review-queue --config C [--mode needs_confirmation\|unreviewed_machine] [--split all\|train\|val\|test]` | Queue every item that needs human confirmation into `review/` | ✅ |
 | `python -m cv_pipeline export --config C [--dry-run]` | Validated, immutable YOLO dataset export | ✅ |
-| `python -m cv_pipeline validate --config C` | Dataset checks + report | Phase 6 |
-| `python -m cv_pipeline train --config C` | Optional Ultralytics training | Phase 7 |
+| `python -m cv_pipeline train --config C --export-run EXP [--dry-run] [--attempt N] [--device D]` | Train/fine-tune YOLO from an explicit, re-verified export | ✅ |
 
 Common flags: `--force` recomputes outputs instead of reusing them; `--log-level DEBUG`
 shows per-file detail.
@@ -297,7 +296,7 @@ imports:
     labels_trusted: true            # made by people -> provenance human_imported
     empty_labels_are_negatives: true  # empty label files = "reviewed, no target objects"
     ignored_only_labels_are_negatives: false  # see "Empty labels and negative images"
-    class_map: {lock: padlock}      # source class -> project class
+    class_map: {Lock: lock}         # source class -> project class (only if names differ)
     ignore_classes: []              # source classes deliberately dropped
 ```
 
@@ -611,6 +610,7 @@ python -m cv_pipeline review-queue --config C            # queue EVERY item with
 python -m cv_pipeline labels  --config C                 # resolve + fingerprint labels
 python -m cv_pipeline augment --config C                 # train only, trusted labels only
 python -m cv_pipeline export  --config C                 # validated YOLO dataset
+python -m cv_pipeline train   --config C --export-run exp_...   # explicit export only
 ```
 
 `review-queue` trusts nothing and changes no provenance; it only writes the review queue.
@@ -686,6 +686,117 @@ augmentation run identity (or none), the export config (policies, classes, mappi
 non-target policy) and the pipeline version. `--dry-run` performs every check, including
 re-hashing, and writes nothing.
 
+## Training
+
+`train` trains or fine-tunes an Ultralytics YOLO detector from an **explicit** export run.
+It never picks the newest export automatically, and it's a separate command that
+`prepare` never runs. The same command works on CPU, Apple MPS and NVIDIA CUDA, and on any
+machine where the workspace (or just `export/runs/<id>/`) is present.
+
+```bash
+python -m cv_pipeline train --config C --export-run exp_... --dry-run    # every check; starts nothing
+python -m cv_pipeline train --config C --export-run exp_... --device 0   # e.g. on a CUDA box
+```
+
+**The export is re-verified before training, and again after.** This uses only the export
+folder; nothing from Phase 6 is trusted blindly. Training is refused if:
+
+- `run.json` doesn't hash to the run ID;
+- `dataset.yaml` doesn't equal the regenerated text byte for byte (classes, paths, flags);
+- any manifest image or label is missing or has a different sha256;
+- a label doesn't parse, or disagrees with the manifest;
+- there are files the manifest doesn't list;
+- the split counts differ;
+- the manifest-level leakage checks fail (one split per item, group, source and family;
+  augmented images only in train, with train parents).
+
+An export marked `incomplete_evaluation_set: true` is refused unless
+`training.allow_incomplete_evaluation: true` is set. That override is recorded, warned
+about, and its metrics are flagged `holdout_complete: false`.
+
+**Initialization. Fine-tuning is not resuming:**
+
+| `initialization.mode` | Use for | Class rule |
+|---|---|---|
+| `pretrained` | Standard Ultralytics base weights (e.g. `yolo11s.pt`) | The checkpoint must be the stock COCO-80 detector; a new head is built for the export's classes |
+| `finetune` | A NEW run initialized from custom weights (e.g. `best_loto.pt`) | Checkpoint class names and order must **exactly** equal the export classes |
+
+- Mismatches are refused, with a diff. Different order counts as a mismatch because class
+  IDs would change meaning. Nothing is renamed or remapped (no `padlock` → `lock`).
+- Deliberate head replacement isn't supported.
+- Ultralytics `resume` (continuing the same interrupted run with its optimizer state) is
+  never used; `resume=False` is always passed.
+- Weights are only read from local files unless `allow_download: true` is set for a stock
+  model name.
+
+**Comparing baselines.** Train the same export twice, explicitly: once with
+`mode: pretrained` on a stock base model, and once with `mode: finetune` on your existing
+model. They get different run IDs and separate metrics.
+
+**Settings.** `epochs`, `imgsz`, `batch`, `device`, `workers`, `patience`, `seed`
+(default `project.seed`), `deterministic`, `cache`, `evaluate_test`, plus
+`trainer_args`, a **validated allowlist** of further Ultralytics arguments (optimizer, lr0,
+…, augmentation knobs). Anything outside the allowlist, such as `resume`, `project` or
+`data`, is a config error.
+
+> **Ultralytics augments during training by default** (`fliplr: 0.5`, `hsv_h: 0.015`,
+> `mosaic: 1.0`). If flips or hue are semantically unsafe for your project (as for LOTO),
+> set them explicitly, e.g. `trainer_args: {fliplr: 0.0, hsv_h: 0.0}`. The effective
+> values are always recorded.
+
+**Devices.**
+
+- `null` / `auto` picks CUDA:0, then MPS, then CPU. `mps` and CUDA values (`0`, `0,1`,
+  `cuda:0`) are checked against what torch can see, and refused if unavailable.
+- `--device` overrides the config.
+- The run records the requested and resolved device, torch, Ultralytics and CUDA versions,
+  GPU names and MPS availability.
+- Results aren't bit-for-bit reproducible across hardware, and the pipeline doesn't claim
+  they are. The run identity records configuration and inputs.
+
+**Run layout** (`training/runs/trn_<id>/`, never overwritten):
+
+```
+run.json      status (running → completed | failed | interrupted), start/end times, export
+              lineage (run ID, fingerprint, dataset snapshot, split revision, labels
+              fingerprint, augmentation run, classes, mapping), initialization (reference,
+              path, sha256, mode, checkpoint classes and metadata, class check), effective
+              trainer args, seed, versions, device, overrides, warnings, metrics, artifact
+              manifest (path, sha256, bytes)
+config.yaml   resolved pipeline config
+dataset/      staged view of the export (hard links). Ultralytics caches land here, never
+              in the export
+ultralytics/{train,val,test}/   all Ultralytics output (project and name pinned; no stray runs/)
+weights/best.pt, weights/last.pt
+metrics.json  {"validation": …, "test": …, "holdout_complete": …}
+report.md, error.txt (on failure)
+```
+
+- **Run ID:** `trn_` + sha256 of the export run ID and fingerprint, the initialization
+  sha256 and mode, the effective arguments, the requested device, the Ultralytics and torch
+  versions, and `--attempt`.
+- **Existing runs:** a completed run is reported back, never retrained. A failed,
+  interrupted or still-running one is kept for diagnosis; start a new one with
+  `--attempt N`.
+- **Evaluation:** Ultralytics selects `best.pt` on val fitness. It's then evaluated on
+  `val`, and on `test` if present and `evaluate_test` is on. The test split is never used
+  to choose anything, and val and test metrics are stored separately, exactly as
+  Ultralytics reports them.
+- **No promotion:** new weights stay inside their run. The initialization model is only
+  read, and its hash is checked again after training.
+
+### LOTO class names
+
+Don't assume a taxonomy. The deployed LOTO model uses names including `isolation_point`,
+`lock` and `loto_tag`. Before the first real run:
+
+1. inspect the historical Roboflow `data.yaml` and the deployed checkpoint's class names;
+2. choose the canonical `classes` (and `export.classes` for the trained detector);
+3. map any differing source names explicitly in `imports[].class_map`.
+
+To fine-tune from the deployed model, its classes must equal `export.classes` exactly;
+otherwise train a fresh baseline with `mode: pretrained`. Nothing is renamed silently.
+
 ## Configuration
 
 See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
@@ -704,7 +815,7 @@ See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
 | `split` | `train` / `val` / `test` fractions (sum to 1; val/test may be 0), tie-break `seed`, `require_nonempty`, `conflict_resolutions` |
 | `augmentation` | Train-only: label policy, variants per item, seed, box safety (`min_visibility`, `min_box_area`, `allow_partial_box_loss`, `max_attempts`), output format, transform overrides |
 | `export` | Label policy, `evaluation_policy` (strict / non_strict), augmentation run selection, training `classes`, `non_target_classes` |
-| `training` | Ultralytics model, epochs, imgsz, batch, device, patience |
+| `training` | `initialization` (model, mode pretrained/finetune, allow_download), epochs, imgsz, batch, device, workers, patience, seed, deterministic, cache, incomplete-evaluation override, test evaluation, allowlisted `trainer_args` |
 
 Loading is strict: unknown keys, wrong types, and inconsistent values (e.g. split fractions
 not summing to 1) fail immediately with a clear message.
@@ -741,6 +852,7 @@ cv_pipeline/
                      label-usage rules, deliberate review queue
     augmentation/    transform registry, train-only augmentation runs, report
     export/          validated, immutable YOLO export and report
+    training/        export re-verification, trainer backend (Ultralytics), training runs
     splitting/       history, reconciliation, deterministic allocation, split report
     utils/           structured logging, hashing, atomic file I/O
 configs/             example.yaml, loto.example.yaml
@@ -771,6 +883,7 @@ tests/
     export/
         active_run.json       pointer to the current export run
         runs/<run_id>/        immutable YOLO dataset (see "Validated YOLO export")
+    training/runs/<run_id>/   training runs (see "Training")
     annotations/
         active_run.json       pointer to the current run (mutable)
         runs/<run_id>/        immutable: run.json, items.csv, predictions.csv, labels/
@@ -823,7 +936,7 @@ Later phases add `dataset/`, `runs/` and more manifests.
 | 4.5 | Legacy YOLO/Roboflow import, label provenance, review decisions, trusted-label resolution | ✅ |
 | 5 | Albumentations augmentation of train only, bbox-safe, lineage, using resolved trusted labels | ✅ |
 | 6 | Validated, immutable YOLO export: fingerprint consistency, re-hashing, strict held-out coverage, class taxonomy, leakage assertions; deliberate review queue | ✅ |
-| 7 | Optional `train` command, end-to-end test, full documentation | ⏳ |
+| 7 | Reproducible YOLO training/fine-tuning from an explicit, re-verified export; class-safety, device handling, immutable runs | ✅ |
 
 ## Testing
 
@@ -838,6 +951,12 @@ backend, so no model is needed either.
 There is also an optional Ultralytics integration smoke test, skipped by default. It
 checks loading, schema, caching and CPU determinism with a stock COCO model. **It does not
 measure annotation quality for any project.**
+
+Optional real 1-epoch CPU training smoke test (skipped by default; same stock weights):
+
+```bash
+CV_PIPELINE_TRAIN_SMOKE_MODEL=~/.cache/cv-pipeline-smoke/yolo11n.pt pytest tests/test_training_smoke.py
+```
 
 ```bash
 mkdir -p ~/.cache/cv-pipeline-smoke
