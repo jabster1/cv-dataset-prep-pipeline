@@ -12,14 +12,17 @@ they refer to* — never on machine predictions — and fingerprints exactly tha
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from cv_pipeline.config import PipelineConfig
 from cv_pipeline.dedup.report import dedup_settings
+from cv_pipeline.lineage import components, family_links, lineage_fp
 from cv_pipeline.manifest import DedupRecord, ImageHashRecord, ItemRecord, read_records
 from cv_pipeline.utils.fingerprint import digest
+from cv_pipeline.utils.hashing import sha256_file
 from cv_pipeline.workspace import Workspace
 
 SPLIT_INPUT_SCHEMA = "cvp-split-input-v1"
@@ -92,7 +95,9 @@ def load_dataset_state(cfg: PipelineConfig) -> DatasetState:
         )
 
     _check_dedup_settings(ws, dedup_settings(cfg.dedup))
-    _check_dedup_content(ws, cfg, items, dedup)
+    links = family_links(ws, {i.source_id for i in items.values()})
+    _check_dedup_lineage(ws, links)
+    _check_dedup_content(ws, cfg, items, dedup, links)
     eligible = tuple(sorted(i for i in items if not dedup[i].excluded))
     return DatasetState(items=items, dedup=dedup, eligible_ids=eligible)
 
@@ -137,18 +142,40 @@ def _check_dedup_settings(ws: Workspace, expected: dict[str, Any]) -> None:
         )
 
 
+def _check_dedup_lineage(ws: Workspace, links: dict[str, tuple[str, ...]]) -> None:
+    """dedup.csv must have been grouped with the current lineage families."""
+    try:
+        report = json.loads((ws.reports / "duplicates.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DatasetStateError("Cannot read reports/duplicates.json — re-run dedup.") from exc
+    recorded = (report.get("lineage") or {}).get("lineage_fp", lineage_fp({}))
+    if recorded != lineage_fp(links):
+        raise DatasetStateError(
+            "Lineage families (e.g. Roboflow derivative families from imports) changed since "
+            "dedup.csv was produced — re-run the dedup stage."
+        )
+
+
 def _check_dedup_content(
     ws: Workspace,
     cfg: PipelineConfig,
     items: dict[str, ItemRecord],
     dedup: dict[str, DedupRecord],
+    links: dict[str, tuple[str, ...]],
 ) -> None:
     """dedup.csv must describe the files currently referenced by items.csv."""
     if not cfg.dedup.enabled:
-        regrouped = sorted(i for i, d in dedup.items() if d.split_group != d.source_id)
-        if regrouped:
+        # Without hashing, groups may only merge sources linked by lineage families.
+        comp = components({d.source_id for d in dedup.values()}, links)
+        by_group: dict[str, set[str]] = {}
+        by_comp: dict[str, set[str]] = {}
+        for d in dedup.values():
+            by_group.setdefault(d.split_group, set()).add(d.source_id)
+            by_comp.setdefault(comp[d.source_id], set()).add(d.source_id)
+        if sorted(map(sorted, by_group.values())) != sorted(map(sorted, by_comp.values())):
             raise DatasetStateError(
-                "dedup is disabled but dedup.csv contains merged split groups — re-run dedup."
+                "dedup is disabled but dedup.csv split groups do not match the source/lineage "
+                "grouping — re-run dedup."
             )
         return
     cache_path: Path = ws.image_hash_cache
@@ -168,4 +195,27 @@ def _check_dedup_content(
         raise DatasetStateError(
             f"dedup.csv was computed from different file content for {len(stale)} items "
             f"(e.g. {stale[0]}; workspace files changed since dedup) — re-run the dedup stage."
+        )
+
+
+def verify_workspace_files(
+    cfg: PipelineConfig, state: DatasetState, item_ids: Iterable[str]
+) -> None:
+    """Re-hash workspace image files and require them to match items.csv.
+
+    Used before producing derived outputs (resolved labels, later augmentation/export) so
+    that nothing is derived from bytes that differ from the validated dataset state.
+    """
+    ws = Workspace(cfg.workspace_dir)
+    bad = []
+    for iid in sorted(item_ids):
+        item = state.items[iid]
+        path = ws.root / item.path
+        actual = sha256_file(path) if path.is_file() else "<missing>"
+        if actual != item.sha256:
+            bad.append(iid)
+    if bad:
+        raise DatasetStateError(
+            f"{len(bad)} workspace image file(s) differ from items.csv (e.g. {bad[0]}); they "
+            "were modified or deleted after ingest — re-run ingest (with --force)."
         )

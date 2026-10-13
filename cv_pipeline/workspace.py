@@ -103,6 +103,18 @@ class Workspace:
         return self.splits / "items.csv"
 
     @property
+    def imports(self) -> Path:
+        return self.root / "imports"
+
+    @property
+    def source_refs_manifest(self) -> Path:
+        return self.manifests / "source_refs.csv"
+
+    @property
+    def labels_dir(self) -> Path:
+        return self.root / "labels"
+
+    @property
     def resolved_config(self) -> Path:
         return self.root / "config.resolved.yaml"
 

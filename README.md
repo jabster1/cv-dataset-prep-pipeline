@@ -7,8 +7,9 @@ names in a YAML config, and run one command.
 Nothing is project-specific: the first use case is Lockout/Tagout (LOTO) detection, but
 the same pipeline works for tools, industrial equipment, or anything else.
 
-> **Status:** Phases 1–4 of 7 are implemented (foundation, ingestion, deduplication,
-> automatic annotation, source-aware splitting). See
+> **Status:** Phases 1–5 of 7 are implemented (foundation, ingestion, deduplication,
+> automatic annotation, source-aware splitting, legacy dataset import and label
+> provenance, train-only augmentation). See
 > [Roadmap](#roadmap). Commands for later stages are documented as they land.
 
 ---
@@ -58,14 +59,17 @@ Then look in `workspaces/example/`.
 
 | Command | What it does | Status |
 |---|---|---|
-| `python -m cv_pipeline prepare --config C` | Run every enabled preparation stage in order | ✅ (currently: ingest → dedup → annotate if `annotation.enabled` → split) |
+| `python -m cv_pipeline prepare --config C` | Run every enabled preparation stage in order | ✅ (currently: ingest → dedup → annotate if `annotation.enabled` → split → augment if `augmentation.enabled`) |
 | `python -m cv_pipeline ingest --config C` | Copy images, sample video frames, write lineage manifest | ✅ |
 | `python -m cv_pipeline dedup --config C` | Exact + near-duplicate detection, split groups, duplicates report | ✅ |
 | `python -m cv_pipeline annotate --config C [--limit N]` | Pre-label eligible images with a detector; build the review queue | ✅ |
 | `python -m cv_pipeline split --config C [--dry-run]` | Source-aware train/val/test assignment that preserves history | ✅ |
 | `python -m cv_pipeline split --config C --resplit --reason TEXT [--confirm TOKEN]` | Deliberately rebuild all assignments (previews unless confirmed) | ✅ |
+| `python -m cv_pipeline import-dataset --config C --name N [--dry-run]` | Explicitly import an existing labeled YOLO/Roboflow dataset listed under `imports` | ✅ |
+| `python -m cv_pipeline labels --config C [--allow-machine-unreviewed] [--allow-imported-unverified] [--allow-machine-empty]` | Resolve each item's label with provenance (trusted human labels only by default) | ✅ |
 | `python -m cv_pipeline show-config --config C` | Print the fully resolved config | ✅ |
-| `augment`, `export` | Individual stages | Phases 5–6 |
+| `python -m cv_pipeline augment --config C [--dry-run]` | Augment trusted-labelled **train** items only | ✅ |
+| `export` | YOLO dataset export | Phase 6 |
 | `python -m cv_pipeline validate --config C` | Dataset checks + report | Phase 6 |
 | `python -m cv_pipeline train --config C` | Optional Ultralytics training | Phase 7 |
 
@@ -273,9 +277,135 @@ only if it still holds exactly what the pipeline last wrote (tracked in
 `review/.export_state.csv`). Otherwise it is kept and marked `label_state=edited`. Nothing
 under `review/` is ever deleted.
 
-A later phase adds importing review decisions. Those will produce records with the same
-box schema, `provenance=human` and `based_on_run_id`, so dataset export can prefer
-human-reviewed labels.
+Reviewing makes a machine label trusted only through an explicit entry in
+`review/decisions.csv` (see "Label provenance"). An edited file alone is never
+interpreted as a review.
+
+## Importing an existing labeled dataset
+
+Projects often start with a historical, manually annotated dataset, for example a
+Roboflow YOLO export that trained an earlier model. Import it explicitly. `prepare` never
+crawls for datasets.
+
+```yaml
+imports:
+  - name: loto_roboflow_v1          # immutable once imported; a new version gets a new name
+    path: data/loto/legacy/roboflow_v1
+    format: yolo
+    labels_trusted: true            # made by people -> provenance human_imported
+    empty_labels_are_negatives: true  # empty label files = "reviewed, no target objects"
+    ignored_only_labels_are_negatives: false  # see "Empty labels and negative images"
+    class_map: {lock: padlock}      # source class -> project class
+    ignore_classes: []              # source classes deliberately dropped
+```
+
+```bash
+python -m cv_pipeline import-dataset --config C --name loto_roboflow_v1 --dry-run   # validate only
+python -m cv_pipeline import-dataset --config C --name loto_roboflow_v1
+python -m cv_pipeline prepare --config C        # imported + new data: ingest -> dedup -> ... -> split
+python -m cv_pipeline labels --config C         # resolved labels + provenance report
+```
+
+- **Supported layouts:** Roboflow (`train|valid|test/images|labels`) and Ultralytics
+  (`images|labels/train|val|test`), each with a `data.yaml` whose `names` may be a list or
+  an id → name mapping.
+- **The export is only read.** A verified byte copy goes to `<workspace>/imports/<name>/`,
+  together with `images.csv`, `boxes.csv`, `rejected.csv`, `import.json` and
+  `reports/import_<name>.md`.
+- **Labels are validated, never silently trusted.** Each line needs exactly 5 values, a
+  valid class ID, finite coordinates with the centre in [0, 1] and width/height in (0, 1],
+  and a box that stays inside the image. Any bad line marks the file `invalid`; the image
+  is still imported, but unlabeled. Empty and missing label files are recorded explicitly.
+- **The taxonomy must fit the project.** Every source class must be a project class,
+  mapped in `class_map`, or listed in `ignore_classes`; otherwise the import fails before
+  writing anything. Duplicate names and several source classes mapping to one project
+  class are rejected.
+- **Imports are part of the one corpus.** Ingest treats every configured import as another
+  root (origin `import:<name>`), so imported images get normal content-addressed IDs and go
+  through dedup, split groups and split history with the raw data.
+- **Byte-identical files from different origins are one item.**
+  `manifests/source_refs.csv` keeps every reference (origin, path, legacy split), and raw
+  copies are preferred as canonical. Pixel-identical copies are excluded by dedup, and
+  their labels transfer to the kept copy. Near-duplicates share a split group.
+- **The legacy split is metadata only.** It is recorded in `source_refs.csv` and in the
+  labels report's legacy-vs-current table, and never used as the pipeline split. Imported
+  and new data are split fresh by group, together. Keeping an old test set would have to be
+  a separate, explicit option (not implemented).
+- **Integrity is checked twice.** Imported files are re-verified against `images.csv` at
+  ingest, and workspace files are re-hashed before label output is produced.
+- **Roboflow derivative families always stay together.** Roboflow renames exported files
+  `<original stem>_<ext>.rf.<32 hex>.<ext>`, and an augmented export can contain several
+  transformed versions of one original. Flips, crops and similar changes are often not
+  caught by perceptual hashing.
+  - Files in one imported dataset that share an original stem form a lineage family. The
+    key is namespaced by dataset, `import:<name>:roboflow:<stem>`, so datasets never
+    collide.
+  - Dedup forces every family into one split group, even with dedup disabled.
+  - A family is not a duplicate: nothing is excluded or deleted because of it.
+  - Only names matching the pattern exactly form families; nothing is inferred otherwise.
+  - Family keys are recorded in `images.csv` and `source_refs.csv`, and counted in the
+    import and duplicates reports.
+- **Recommended workflow:** export future Roboflow versions **without augmentation**, and
+  let the pipeline own train-only augmentation. Older augmented exports remain safe
+  because of the family grouping.
+- **EXIF orientation is reported, not changed.** Imported images whose EXIF orientation tag
+  isn't 1 are listed in the import report and log, because they decode rotated. Files are
+  never modified.
+
+## Label provenance and trust
+
+Every label has explicit provenance:
+
+| Provenance | From | Trusted by default |
+|---|---|---|
+| `human_reviewed_corrected` | `review/decisions.csv` `corrected`, plus the edited `review/labels/<item>.txt` | ✅ |
+| `human_reviewed_accepted` | `review/decisions.csv` `accepted`, plus that run's machine labels | ✅ |
+| `human_imported` | An import with `labels_trusted: true` | ✅ |
+| `imported_unverified` | An import with `labels_trusted: false` | `--allow-imported-unverified` |
+| `machine_unreviewed` | The active annotation run, only if it matches the current dataset state | `--allow-machine-unreviewed` |
+
+`cv_pipeline.labels.LabelResolver` is the single interface later stages use. It returns
+`trusted`, `opt_in`, `unavailable` (with a reason) or `conflict` for each item, so they
+don't need to know where a label came from.
+
+- The highest-priority usable label wins, in the order of the table above.
+- Labels from exact-duplicate copies are included.
+- Different labels at the same priority are a `conflict`, and no label is used.
+
+**Empty labels and negative images:**
+
+| Situation | Result |
+|---|---|
+| Imported empty file, trusted import, `empty_labels_are_negatives` | Trusted negative |
+| Imported empty file otherwise | Unavailable (`empty_label_not_confirmed_negative`) |
+| Imported file whose boxes are **all** in `ignore_classes`, trusted import, `ignored_only_labels_are_negatives: true` | Trusted negative, noted `ignored_only_source_annotation` |
+| Imported ignored-only file otherwise (the default) | Unavailable (`ignored_only_unconfirmed_negative`). Dropping other classes doesn't prove the project's targets were looked for. |
+| A human accepts a machine result with zero detections | Trusted negative |
+| Machine zero detections | **Never** a negative, even with `--allow-machine-unreviewed`, unless `--allow-machine-empty` is also given |
+| Failed or unreadable inference | No label |
+| Not reviewed | Unavailable (`machine_label_not_reviewed`) |
+
+### Review decisions (`review/decisions.csv`)
+
+| Column | Required | Meaning |
+|---|---|---|
+| `item_id` | ✅ | |
+| `based_on_run_id` | ✅ | The annotation run that was reviewed |
+| `decision` | ✅ | `accepted` \| `corrected` \| `rejected` |
+| `reviewer`, `notes` | | |
+| `label_sha256` | | For `corrected`: if given, it must match the edited file |
+
+- **`accepted`:** the machine label is correct as-is. It is invalid if the review label was
+  edited; that should be `corrected`.
+- **`corrected`:** the edited `review/labels/<item>.txt` is the trusted label.
+- **`rejected`:** that run's machine label is never used, under any policy.
+- The last row for an item wins.
+- Rows are checked: unknown items or runs, items missing from the run, and image content
+  that changed since the run are all reported as invalid and ignored.
+
+`labels` writes `labels/resolved.csv`, `labels/boxes.csv` and `reports/labels.{json,md}`.
+The report covers status, provenance, unavailable reasons, negatives, label status per
+split, the legacy-vs-current split table, conflicts and invalid decisions.
 
 ## Train/val/test splitting
 
@@ -375,6 +505,98 @@ python -m cv_pipeline split --config C --resplit --reason "dedup thresholds re-t
 The outputs are deterministic: the same snapshot, history and config give byte-identical
 files, whatever the row or filesystem order.
 
+## Train-only augmentation
+
+`augment` creates augmented copies of **train** items whose label resolves under the
+chosen policy. Val and test items are never augmented. Every augmented image keeps full
+lineage to its parent.
+
+```
+validated dataset state + latest split revision + LabelResolver(policy)
+   │  the split snapshot must equal the label/dataset snapshot, or nothing is written
+   ▼
+train items ──usable label?──▶ eligible ──▶ variants (seeded; retried) ──▶ augmentation/runs/<run_id>/
+           └──────────────────▶ skipped (reported, never treated as background)
+```
+
+**Label policy (`augmentation.label_policy`):**
+
+- `trusted_only` (default) uses only `human_imported`, `human_reviewed_accepted` and
+  `human_reviewed_corrected` labels.
+- `allow_machine_unreviewed` is a development/POC opt-in for unreviewed machine labels. It
+  needs the annotation run to be current for this dataset state. Machine zero-detection
+  results are still not negatives unless `allow_machine_empty: true` is also set.
+- Each augmented item records the provenance of its parent's label. Machine labels are
+  never promoted to trusted.
+
+**Skipped train items** are reported by category: `label_unavailable`, `label_untrusted`
+(not reviewed, rejected, unverified import, unconfirmed empty or ignored-only),
+`label_conflict` and `annotation_failed`. A trusted human negative is valid training data
+and is augmented box-free.
+
+**Refusals (exit 1, nothing written):**
+
+- no split yet;
+- the split was made from a different dataset state (re-run `split`, and `ingest`/`dedup`
+  first if data or imports changed);
+- machine opt-in with a stale annotation run (re-run `annotate`);
+- the shared dataset-state check fails;
+- a workspace image differs from `items.csv`. Every file is re-hashed before generation,
+  and each parent again while it's read.
+
+**Bounding-box safety.** Boxes use Albumentations' YOLO format with `clip=True`,
+`min_visibility` and `min_box_area`, and are then checked to be finite, non-empty and
+inside the image.
+
+- A positive image that loses **any** box is retried. This is configurable with
+  `allow_partial_box_loss`; losing **all** boxes is never accepted.
+- Retries use deterministic seeds, up to `max_attempts`. A variant that fails every attempt
+  is recorded in `rejected.csv`; nothing silently becomes a negative.
+- Trusted negatives stay box-free.
+
+**Conservative default transforms** (generic; override per project under
+`augmentation.transforms.<name>`; always applied in this fixed order):
+
+| On by default | Off by default (opt in deliberately) |
+|---|---|
+| `brightness_contrast` (±0.15) | `horizontal_flip`: mirrors text, left/right, handle position |
+| `hue_saturation_value` (hue **0**, sat ±15, val ±10) | `rotate` (±5°): boxes grow; orientation may carry meaning |
+| `gaussian_blur` (3 px) | `gamma` |
+| `gauss_noise` (std 0.01–0.03) | `perspective` |
+| `image_compression` (quality 70–95) | `bbox_safe_crop` |
+| `affine` (scale 0.9–1.1, translate ±5%, rotation 0) | |
+
+Hue is 0 by default because colour can encode state, such as red/green indicators or
+coloured tags. Disable anything that could change what an object means in your project.
+
+**Run identity and immutability.** `run_id` covers:
+
+- the dataset `snapshot_fp`;
+- the split revision and its state digest;
+- a digest of every train item's resolved label;
+- the full resolved augmentation config (policy, variants, seed, box settings, retries,
+  every transform and its parameters, output format);
+- the versions of albumentations, albucore, opencv-python and numpy.
+
+The same inputs give byte-identical images and manifests. Changing anything creates a new
+run, and completed runs are verified and reused, never rewritten.
+
+**Outputs.** `augmentation/runs/<run_id>/` contains:
+
+- `images/` and `labels/` (YOLO);
+- `items.csv`: `aug_item_id`, parent item, `source_id`, `split_group`, `split=train`, split
+  revision, origin, Roboflow family key, label provenance, source ref and sha, parent
+  negative, seed, attempt, recipe (applied transforms and sampled parameters), input and
+  output sha256, boxes before and after;
+- `skipped.csv`, `rejected.csv` and `run.json`.
+
+`augmentation/active_run.json` points to the current run.
+`reports/augmentation.{json,md}` includes a **train-only check** (augmented parents per
+split; val and test must be 0), skip reasons, provenance, trusted negatives, machine labels
+used, transform counts, rejections, and training items by source (raw, historical import,
+Roboflow family members, generated). Augmented items never enter `items.csv`, dedup or
+split history.
+
 ## Configuration
 
 See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
@@ -389,8 +611,9 @@ See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
 | `dedup` | Hash size, pHash/dHash thresholds, exact/near-duplicate actions, grouping for splits |
 | `annotation` | Backend (`yolo`), `model`, thresholds, batch size, `class_map`, review triggers, audit sample rate, backend `options` |
 | `review` | Which items to export (`flagged` / `all`), copy images, draw previews |
+| `imports` | Existing labeled datasets to import explicitly: name, path, format, trust, negatives, class map, ignored classes |
 | `split` | `train` / `val` / `test` fractions (sum to 1; val/test may be 0), tie-break `seed`, `require_nonempty`, `conflict_resolutions` |
-| `augmentation` | Copies per **train** image, transforms and their probabilities |
+| `augmentation` | Train-only: label policy, variants per item, seed, box safety (`min_visibility`, `min_box_area`, `allow_partial_box_loss`, `max_attempts`), output format, transform overrides |
 | `training` | Ultralytics model, epochs, imgsz, batch, device, patience |
 
 Loading is strict: unknown keys, wrong types, and inconsistent values (e.g. split fractions
@@ -423,6 +646,9 @@ cv_pipeline/
     annotation/      backend protocol + registry, YOLO backend, policy, identities, cache,
                      immutable run snapshots, review queue, previews, report
     dataset_state.py validated ingest/dedup state + split-input snapshot fingerprint
+    imports/         YOLO/Roboflow export validation, immutable import snapshots
+    labels/          provenance, review decisions, LabelResolver, labels report
+    augmentation/    transform registry, train-only augmentation runs, report
     splitting/       history, reconciliation, deterministic allocation, split report
     utils/           structured logging, hashing, atomic file I/O
 configs/             example.yaml, loto.example.yaml
@@ -442,6 +668,14 @@ tests/
         dedup.csv             per-item duplicate status + split_group
         duplicate_pairs.csv   linked pairs with kind and distances
         image_hashes.csv      hash cache
+        source_refs.csv       every file reference per source (origin, path, legacy split)
+    imports/<name>/           immutable import snapshots: files/, images.csv, boxes.csv,
+                              rejected.csv, import.json
+    labels/                   resolved.csv, boxes.csv (label resolution output)
+    augmentation/
+        active_run.json       pointer to the current augmentation run
+        runs/<run_id>/        immutable: images/, labels/, items.csv, skipped.csv,
+                              rejected.csv, run.json
     annotations/
         active_run.json       pointer to the current run (mutable)
         runs/<run_id>/        immutable: run.json, items.csv, predictions.csv, labels/
@@ -459,6 +693,9 @@ tests/
         duplicates.json / duplicates.md
         annotation.json / annotation.md
         split.json / split.md
+        import_<name>.json / .md
+        labels.json / labels.md
+        augmentation.json / augmentation.md
     logs/pipeline.jsonl       structured JSON-lines log of every run
 ```
 
@@ -472,7 +709,8 @@ Later phases add `dataset/`, `runs/` and more manifests.
 | `path` | File inside the workspace |
 | `source_id` | **Grouping key for splits.** Same for every frame of a video / derivative of an image |
 | `source_type` | `image`, `video_frame` (later `augmented`) |
-| `source_path` | Original file, relative to `raw_dir` |
+| `origin` | `raw` or `import:<name>` |
+| `source_path` | Original file, relative to its origin's root (`raw_dir` or the import snapshot) |
 | `source_sha256` / `sha256` | Hash of the raw source / of this file |
 | `width`, `height` | Pixel size (after EXIF orientation) |
 | `frame_index`, `timestamp_s` | For video frames |
@@ -486,7 +724,8 @@ Later phases add `dataset/`, `runs/` and more manifests.
 | 2 | Exact + perceptual-hash near-duplicate detection, duplicates report | ✅ |
 | 3 | Pluggable annotation (YOLO backend), confidence/review policy, immutable run snapshots, review queue | ✅ |
 | 4 | Source-aware deterministic train/val/test split with persistent history, conflict handling and deliberate resplit | ✅ |
-| 5 | Albumentations augmentation of train only, bbox-safe, lineage | ⏳ |
+| 4.5 | Legacy YOLO/Roboflow import, label provenance, review decisions, trusted-label resolution | ✅ |
+| 5 | Albumentations augmentation of train only, bbox-safe, lineage, using resolved trusted labels | ✅ |
 | 6 | YOLO dataset export + `dataset.yaml`, validation checks, JSON + Markdown report | ⏳ |
 | 7 | Optional `train` command, end-to-end test, full documentation | ⏳ |
 

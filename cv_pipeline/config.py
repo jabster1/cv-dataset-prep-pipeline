@@ -13,6 +13,7 @@ Design notes
 from __future__ import annotations
 
 import math
+import re
 import types
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -101,6 +102,26 @@ class AnnotationConfig:
 
 
 @dataclass
+class ImportConfig:
+    """An existing labeled dataset to import explicitly (``import-dataset --name``)."""
+
+    name: str
+    path: Path
+    format: Literal["yolo"] = "yolo"
+    # True: labels were made by people -> provenance human_imported (trusted).
+    # False: provenance imported_unverified (needs explicit opt-in to be used).
+    labels_trusted: bool = True
+    # Empty label files count as human-confirmed negatives (only if labels_trusted).
+    empty_labels_are_negatives: bool = False
+    # Label files whose boxes are ALL in ignore_classes count as negatives for the project
+    # classes (only if labels_trusted). Off by default: dropping other classes does not
+    # prove the project's targets were looked for and found absent.
+    ignored_only_labels_are_negatives: bool = False
+    class_map: dict[str, str] = field(default_factory=dict)  # source name -> project class
+    ignore_classes: list[str] = field(default_factory=list)  # source classes to drop
+
+
+@dataclass
 class ReviewConfig:
     export: Literal["flagged", "all"] = "flagged"
     copy_images: bool = True
@@ -126,9 +147,22 @@ class SplitConfig:
 
 @dataclass
 class AugmentationConfig:
-    enabled: bool = True
-    copies_per_image: int = 2
-    min_visibility: float = 0.3
+    """Train-only augmentation (see cv_pipeline/augmentation)."""
+
+    enabled: bool = False  # prepare runs augment only when true; `augment` always runs
+    # trusted_only: human_imported / human_reviewed_accepted / human_reviewed_corrected.
+    # allow_machine_unreviewed: development/POC opt-in for unreviewed machine labels.
+    label_policy: Literal["trusted_only", "allow_machine_unreviewed"] = "trusted_only"
+    allow_machine_empty: bool = False  # machine zero detections as negatives (opt-in only)
+    variants_per_item: int = 2
+    seed: int | None = None  # null -> project.seed
+    min_visibility: float = 0.5  # boxes less visible than this after a transform are lost
+    min_box_area: float = 16.0  # pixels^2; smaller boxes are lost
+    allow_partial_box_loss: bool = False  # losing ALL boxes of a positive is never allowed
+    max_attempts: int = 5  # deterministic retries per variant before it is rejected
+    image_format: Literal["jpg", "png"] = "jpg"
+    jpeg_quality: int = 95
+    # Overrides of the conservative defaults in cv_pipeline/augmentation/transforms.py
     transforms: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
@@ -154,6 +188,7 @@ class PipelineConfig:
     dedup: DedupConfig = field(default_factory=DedupConfig)
     annotation: AnnotationConfig = field(default_factory=AnnotationConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
+    imports: list[ImportConfig] = field(default_factory=list)
     split: SplitConfig = field(default_factory=SplitConfig)
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -205,6 +240,8 @@ def _resolve_paths(cfg: PipelineConfig, base_dir: Path) -> None:
 
     cfg.project.workspace = under_root(cfg.project.workspace)
     cfg.ingest.raw_dir = under_root(cfg.ingest.raw_dir)
+    for imp in cfg.imports:
+        imp.path = under_root(imp.path)
     if not cfg.training.runs_dir.is_absolute():
         cfg.training.runs_dir = (cfg.project.workspace / cfg.training.runs_dir).resolve()
 
@@ -284,6 +321,40 @@ def validate_config(cfg: PipelineConfig) -> None:
     # Backend-specific requirements (``model`` for yolo, registered backend name) are
     # checked when annotation is invoked, so other stages run with an incomplete section.
 
+    # Imports
+    names = [i.name for i in cfg.imports]
+    dup_names = sorted({n for n in names if names.count(n) > 1})
+    check(not dup_names, f"imports: duplicate import names {dup_names}")
+    for imp in cfg.imports:
+        where = f"imports[{imp.name}]"
+        check(
+            re.fullmatch(r"[a-z0-9][a-z0-9_-]*", imp.name) is not None,
+            f"{where}: name must match [a-z0-9][a-z0-9_-]*",
+        )
+        for other, label in ((ws, "project.workspace"), (raw, "ingest.raw_dir")):
+            check(
+                not (imp.path.is_relative_to(other) or other.is_relative_to(imp.path)),
+                f"{where}: path must not overlap {label} ({other})",
+            )
+        bad_targets = sorted(set(imp.class_map.values()) - set(cfg.classes))
+        check(not bad_targets, f"{where}: class_map maps to unknown classes {bad_targets}")
+        targets = list(imp.class_map.values())
+        merged = sorted({t for t in targets if targets.count(t) > 1})
+        check(
+            not merged,
+            f"{where}: several source classes map to the same project class {merged}",
+        )
+        both = sorted(set(imp.class_map) & set(imp.ignore_classes))
+        check(not both, f"{where}: classes both mapped and ignored: {both}")
+        check(
+            not (imp.empty_labels_are_negatives and not imp.labels_trusted),
+            f"{where}: empty_labels_are_negatives requires labels_trusted",
+        )
+        check(
+            not (imp.ignored_only_labels_are_negatives and not imp.labels_trusted),
+            f"{where}: ignored_only_labels_are_negatives requires labels_trusted",
+        )
+
     # Split
     s = cfg.split
     fractions = {"train": s.train, "val": s.val, "test": s.test}
@@ -297,8 +368,21 @@ def validate_config(cfg: PipelineConfig) -> None:
 
     # Augmentation
     aug = cfg.augmentation
-    check(aug.copies_per_image >= 0, "augmentation.copies_per_image must be >= 0")
+    check(aug.variants_per_item >= 1, "augmentation.variants_per_item must be >= 1")
     check(0.0 <= aug.min_visibility <= 1.0, "augmentation.min_visibility must be in [0, 1]")
+    check(aug.min_box_area >= 0, "augmentation.min_box_area must be >= 0")
+    check(aug.max_attempts >= 1, "augmentation.max_attempts must be >= 1")
+    check(1 <= aug.jpeg_quality <= 100, "augmentation.jpeg_quality must be in [1, 100]")
+    check(
+        not (aug.allow_machine_empty and aug.label_policy != "allow_machine_unreviewed"),
+        "augmentation.allow_machine_empty requires label_policy: allow_machine_unreviewed",
+    )
+    from cv_pipeline.augmentation.transforms import TransformConfigError, resolve_transforms
+
+    try:
+        resolve_transforms(aug.transforms)
+    except TransformConfigError as exc:
+        errors.append(str(exc))
 
     # Training
     t = cfg.training
