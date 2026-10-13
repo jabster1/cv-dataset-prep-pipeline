@@ -7,9 +7,9 @@ names in a YAML config, and run one command.
 Nothing is project-specific: the first use case is Lockout/Tagout (LOTO) detection, but
 the same pipeline works for tools, industrial equipment, or anything else.
 
-> **Status:** Phases 1–5 of 7 are implemented (foundation, ingestion, deduplication,
+> **Status:** Phases 1–6 of 7 are implemented (foundation, ingestion, deduplication,
 > automatic annotation, source-aware splitting, legacy dataset import and label
-> provenance, train-only augmentation). See
+> provenance, train-only augmentation, validated YOLO export). See
 > [Roadmap](#roadmap). Commands for later stages are documented as they land.
 
 ---
@@ -59,7 +59,7 @@ Then look in `workspaces/example/`.
 
 | Command | What it does | Status |
 |---|---|---|
-| `python -m cv_pipeline prepare --config C` | Run every enabled preparation stage in order | ✅ (currently: ingest → dedup → annotate if `annotation.enabled` → split → augment if `augmentation.enabled`) |
+| `python -m cv_pipeline prepare --config C` | Run every enabled preparation stage in order | ✅ (ingest → dedup → annotate if `annotation.enabled` → split → augment if `augmentation.enabled` → export if `export.enabled`) |
 | `python -m cv_pipeline ingest --config C` | Copy images, sample video frames, write lineage manifest | ✅ |
 | `python -m cv_pipeline dedup --config C` | Exact + near-duplicate detection, split groups, duplicates report | ✅ |
 | `python -m cv_pipeline annotate --config C [--limit N]` | Pre-label eligible images with a detector; build the review queue | ✅ |
@@ -69,7 +69,8 @@ Then look in `workspaces/example/`.
 | `python -m cv_pipeline labels --config C [--allow-machine-unreviewed] [--allow-imported-unverified] [--allow-machine-empty]` | Resolve each item's label with provenance (trusted human labels only by default) | ✅ |
 | `python -m cv_pipeline show-config --config C` | Print the fully resolved config | ✅ |
 | `python -m cv_pipeline augment --config C [--dry-run]` | Augment trusted-labelled **train** items only | ✅ |
-| `export` | YOLO dataset export | Phase 6 |
+| `python -m cv_pipeline review-queue --config C [--mode needs_confirmation\|unreviewed_machine] [--split all\|train\|val\|test]` | Queue every item that needs human confirmation into `review/` | ✅ |
+| `python -m cv_pipeline export --config C [--dry-run]` | Validated, immutable YOLO dataset export | ✅ |
 | `python -m cv_pipeline validate --config C` | Dataset checks + report | Phase 6 |
 | `python -m cv_pipeline train --config C` | Optional Ultralytics training | Phase 7 |
 
@@ -85,6 +86,7 @@ Exit codes:
 | 2 | Invalid configuration |
 | 3 | Annotation completed and all outputs were written, but one or more items failed inference (see `reports/annotation.md`) |
 | 4 | Split-history conflict. Nothing in `splits/` was changed (see `reports/split.md`) |
+| 5 | Export refused: strict evaluation policy and val/test items lack trusted labels (see `reports/export.md`) |
 
 ## Adding images and videos
 
@@ -597,6 +599,93 @@ used, transform counts, rejections, and training items by source (raw, historica
 Roboflow family members, generated). Augmented items never enter `items.csv`, dedup or
 split history.
 
+## From field data to a trusted dataset
+
+```bash
+python -m cv_pipeline prepare --config C                 # ingest -> dedup -> annotate -> split
+python -m cv_pipeline review-queue --config C            # queue EVERY item without a trusted label
+#   review/images, review/labels (machine pre-labels or blank), review/review_manifest.csv
+#   then record decisions in review/decisions.csv:
+#     accepted  / corrected / rejected   with based_on_run_id from review_manifest.csv
+#     corrected with based_on_run_id: manual   for items that had no machine pre-label
+python -m cv_pipeline labels  --config C                 # resolve + fingerprint labels
+python -m cv_pipeline augment --config C                 # train only, trusted labels only
+python -m cv_pipeline export  --config C                 # validated YOLO dataset
+```
+
+`review-queue` trusts nothing and changes no provenance; it only writes the review queue.
+Human edits in `review/labels` are never overwritten. `--split val` and `--split test`
+help close held-out label gaps first.
+
+## Validated YOLO export
+
+`export` turns the canonical pipeline state into an Ultralytics-ready dataset.
+
+**State consistency.** All of the following are checked **before anything is written**.
+On failure, the export refuses with a remediation message.
+
+| Check | Remediation |
+|---|---|
+| Shared dataset-state validation, with **every canonical image re-hashed** | `ingest` / `dedup` |
+| Split revision `snapshot_fp` = dataset `snapshot_fp` | re-run `split` |
+| `labels/state.json`, written by `labels`, matches the dataset snapshot, the export's label policy, and the label resolution recomputed now | re-run `labels` with the same policy flags |
+| The selected augmentation run (`augmentation_run: latest\|none\|<id>`) belongs to the same dataset snapshot, split revision (number and state digest) and train label digest, and used the same label policy | re-run `augment` |
+
+**Inclusion.**
+
+| Item | Exported as |
+|---|---|
+| Train item with a usable label | Image + YOLO label |
+| Trusted negative (any split) | Image + **empty** label |
+| Augmented image from the selected run (parent must be an exported train item) | `images/train/aug_*` only |
+| Item without a usable label | **Excluded** and listed in `excluded.csv` (category and reason), never background |
+
+**Held-out coverage.** The report gives, for val and test: total, exported, positives,
+negatives, unlabeled, untrusted, conflicts and coverage %.
+
+- `evaluation_policy: strict` (default): any val or test item without a usable trusted
+  label refuses the export with **exit code 5**, stating split, totals, usable items,
+  missing items and coverage. An empty val split is also refused.
+- `non_strict`: only usable held-out items are exported, and the export is marked
+  `incomplete_evaluation_set: true` in `dataset.yaml`, `run.json` and the report.
+
+**Classes.** `export.classes` is the training taxonomy: an ordered subset of project
+classes, defaulting to all of them. Export class ID = index in that list, and the full
+project → export mapping is recorded. Boxes of other project classes follow
+`non_target_classes`:
+
+- `error` (default) refuses the export.
+- `drop_boxes` drops them. A positive left with no boxes is excluded, not turned into a
+  negative.
+
+Every exported class ID and box is validated.
+
+**Leakage assertions** fail the export (they never just warn). Each canonical item,
+`split_group`, `source_id` and Roboflow family must appear in exactly one split.
+Augmented images may only be in train and only have train parents; there may be no `aug_*`
+file under val or test, no dedup-excluded item, and no disagreement with split history.
+
+**Output (immutable; identical inputs reuse the run):**
+
+```
+export/runs/exp_<id>/
+  dataset.yaml     names, nc, relative train/val/test paths (no `path`: Ultralytics uses this
+                   file's folder), incomplete_evaluation_set, export_run_id
+  images/{train,val,test}/<item_id|aug_item_id>.<ext>   (collision-free; original name in manifest)
+  labels/{train,val,test}/<same>.txt
+  manifest.csv     per image: split, kind, item_id, aug_item_id, aug_run_id, source_id,
+                   split_group, origin, source_path, family_key, provenance, negative,
+                   boxes, image and label sha256
+  excluded.csv     every active item not exported, with category and reason
+  run.json, report.json, report.md
+export/active_run.json, reports/export.{json,md}
+```
+
+`run_id` covers the dataset snapshot, split revision and digest, label fingerprint,
+augmentation run identity (or none), the export config (policies, classes, mapping,
+non-target policy) and the pipeline version. `--dry-run` performs every check, including
+re-hashing, and writes nothing.
+
 ## Configuration
 
 See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
@@ -614,6 +703,7 @@ See [`configs/example.yaml`](configs/example.yaml) (fully commented) and
 | `imports` | Existing labeled datasets to import explicitly: name, path, format, trust, negatives, class map, ignored classes |
 | `split` | `train` / `val` / `test` fractions (sum to 1; val/test may be 0), tie-break `seed`, `require_nonempty`, `conflict_resolutions` |
 | `augmentation` | Train-only: label policy, variants per item, seed, box safety (`min_visibility`, `min_box_area`, `allow_partial_box_loss`, `max_attempts`), output format, transform overrides |
+| `export` | Label policy, `evaluation_policy` (strict / non_strict), augmentation run selection, training `classes`, `non_target_classes` |
 | `training` | Ultralytics model, epochs, imgsz, batch, device, patience |
 
 Loading is strict: unknown keys, wrong types, and inconsistent values (e.g. split fractions
@@ -647,8 +737,10 @@ cv_pipeline/
                      immutable run snapshots, review queue, previews, report
     dataset_state.py validated ingest/dedup state + split-input snapshot fingerprint
     imports/         YOLO/Roboflow export validation, immutable import snapshots
-    labels/          provenance, review decisions, LabelResolver, labels report
+    labels/          provenance, review decisions, LabelResolver, labels report, shared
+                     label-usage rules, deliberate review queue
     augmentation/    transform registry, train-only augmentation runs, report
+    export/          validated, immutable YOLO export and report
     splitting/       history, reconciliation, deterministic allocation, split report
     utils/           structured logging, hashing, atomic file I/O
 configs/             example.yaml, loto.example.yaml
@@ -671,11 +763,14 @@ tests/
         source_refs.csv       every file reference per source (origin, path, legacy split)
     imports/<name>/           immutable import snapshots: files/, images.csv, boxes.csv,
                               rejected.csv, import.json
-    labels/                   resolved.csv, boxes.csv (label resolution output)
+    labels/                   resolved.csv, boxes.csv, state.json (resolution fingerprint)
     augmentation/
         active_run.json       pointer to the current augmentation run
         runs/<run_id>/        immutable: images/, labels/, items.csv, skipped.csv,
                               rejected.csv, run.json
+    export/
+        active_run.json       pointer to the current export run
+        runs/<run_id>/        immutable YOLO dataset (see "Validated YOLO export")
     annotations/
         active_run.json       pointer to the current run (mutable)
         runs/<run_id>/        immutable: run.json, items.csv, predictions.csv, labels/
@@ -696,6 +791,7 @@ tests/
         import_<name>.json / .md
         labels.json / labels.md
         augmentation.json / augmentation.md
+        export.json / export.md, review_queue.json
     logs/pipeline.jsonl       structured JSON-lines log of every run
 ```
 
@@ -726,7 +822,7 @@ Later phases add `dataset/`, `runs/` and more manifests.
 | 4 | Source-aware deterministic train/val/test split with persistent history, conflict handling and deliberate resplit | ✅ |
 | 4.5 | Legacy YOLO/Roboflow import, label provenance, review decisions, trusted-label resolution | ✅ |
 | 5 | Albumentations augmentation of train only, bbox-safe, lineage, using resolved trusted labels | ✅ |
-| 6 | YOLO dataset export + `dataset.yaml`, validation checks, JSON + Markdown report | ⏳ |
+| 6 | Validated, immutable YOLO export: fingerprint consistency, re-hashing, strict held-out coverage, class taxonomy, leakage assertions; deliberate review queue | ✅ |
 | 7 | Optional `train` command, end-to-end test, full documentation | ⏳ |
 
 ## Testing

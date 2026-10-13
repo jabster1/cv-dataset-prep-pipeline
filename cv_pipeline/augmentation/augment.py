@@ -30,12 +30,17 @@ from typing import Any
 
 import numpy as np
 
-from cv_pipeline.annotation.schema import AnnotationItemRecord, InferenceStatus
 from cv_pipeline.augmentation.report import build_report, render_markdown
 from cv_pipeline.augmentation.transforms import build_pipeline, resolve_transforms
 from cv_pipeline.config import PipelineConfig
 from cv_pipeline.labels import LabelPolicy, LabelResolver, Resolution
-from cv_pipeline.labels.schema import ResolutionStatus, UnavailableReason
+from cv_pipeline.labels.usage import (
+    SkipCategory,
+    failed_inference_items,
+    policy_from_settings,
+    resolution_digest,
+    skip_category,
+)
 from cv_pipeline.manifest import ItemRecord, SourceRefRecord, read_records, write_records
 from cv_pipeline.splitting.history import SplitItemRecord, load_history
 from cv_pipeline.utils.fingerprint import digest
@@ -46,29 +51,12 @@ from cv_pipeline.workspace import Workspace
 
 logger = get_logger("augment")
 
-AUG_SCHEMA = "cvp-augmentation-v1"
+AUG_SCHEMA = "cvp-augmentation-v2"  # v2: label_sha256 recorded per augmented item
 TRAIN = "train"
 
 
 class AugmentationError(RuntimeError):
     """Augmentation refused to run (stale split/labels, missing inputs, integrity)."""
-
-
-class SkipCategory:
-    LABEL_UNAVAILABLE = "label_unavailable"
-    LABEL_UNTRUSTED = "label_untrusted"
-    LABEL_CONFLICT = "label_conflict"
-    ANNOTATION_FAILED = "annotation_failed"
-
-
-_UNTRUSTED_REASONS = {
-    UnavailableReason.NOT_REVIEWED,
-    UnavailableReason.IMPORTED_UNVERIFIED,
-    UnavailableReason.MACHINE_EMPTY,
-    UnavailableReason.EMPTY_NOT_CONFIRMED,
-    UnavailableReason.IGNORED_ONLY,
-    UnavailableReason.REJECTED,
-}
 
 
 @dataclass
@@ -99,6 +87,7 @@ class AugmentedItemRecord:
     height: int
     boxes_before: int
     boxes_after: int
+    label_sha256: str = ""  # sha256 of the written YOLO label file (re-checked by export)
 
 
 @dataclass
@@ -138,11 +127,7 @@ class AugmentResult:
 
 
 def label_policy(cfg: PipelineConfig) -> LabelPolicy:
-    a = cfg.augmentation
-    machine = a.label_policy == "allow_machine_unreviewed"
-    return LabelPolicy(
-        allow_machine_unreviewed=machine, allow_machine_empty=machine and a.allow_machine_empty
-    )
+    return policy_from_settings(cfg.augmentation.label_policy, cfg.augmentation.allow_machine_empty)
 
 
 def run_augment_stage(cfg: PipelineConfig, force: bool = False) -> AugmentResult:
@@ -182,7 +167,7 @@ def run_augment(cfg: PipelineConfig, dry_run: bool = False) -> AugmentResult:
         )
     items = resolver.state.items
     families = _families(ws)
-    failed = _failed_inference(ws, resolver)
+    failed = failed_inference_items(ws, resolver)
     parents: list[_Parent] = []
     skipped: list[SkippedItemRecord] = []
     for iid in sorted(split_rows):
@@ -193,7 +178,7 @@ def run_augment(cfg: PipelineConfig, dry_run: bool = False) -> AugmentResult:
         if res.usable:
             parents.append(_Parent(items[iid], row, res, families.get(items[iid].source_id, "")))
         else:
-            skipped.append(SkippedItemRecord(iid, _skip_category(res, iid in failed), res.reason))
+            skipped.append(SkippedItemRecord(iid, skip_category(res, iid in failed), res.reason))
     for p in parents:  # hard guard: nothing outside train can reach generation
         if p.split.split != TRAIN:
             raise AssertionError(f"refusing to augment non-train item {p.item.item_id}")
@@ -216,20 +201,8 @@ def run_augment(cfg: PipelineConfig, dry_run: bool = False) -> AugmentResult:
     }
     versions = {n: _version(n) for n in ("albumentations", "albucore", "opencv-python", "numpy")}
     config_fp = digest({"schema": AUG_SCHEMA, "config": config_payload, "versions": versions})
-    labels_digest = digest(
-        [
-            [
-                iid,
-                r.status,
-                r.label.provenance if r.label else "",
-                r.label.label_sha256 if r.label else "",
-                r.reason,
-            ]
-            for iid, r in sorted(
-                [(p.item.item_id, p.resolution) for p in parents]
-                + [(s.item_id, resolver.resolve(s.item_id)) for s in skipped]
-            )
-        ]
+    labels_digest = resolution_digest(
+        [p.resolution for p in parents] + [resolver.resolve(s.item_id) for s in skipped]
     )
     identity = {
         "snapshot_fp": resolver.snapshot_fp,
@@ -357,9 +330,8 @@ def _generate(
                     f"{c} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}"
                     for c, (cx, cy, w, h) in zip(out_cls, out_boxes, strict=True)
                 ]
-                (tmp / "labels" / f"{aug_id}.txt").write_text(
-                    "".join(f"{line}\n" for line in lines), encoding="utf-8"
-                )
+                label_bytes = "".join(f"{line}\n" for line in lines).encode("utf-8")
+                (tmp / "labels" / f"{aug_id}.txt").write_bytes(label_bytes)
                 h, w = out_img.shape[:2]
                 out_items.append(
                     AugmentedItemRecord(
@@ -389,6 +361,7 @@ def _generate(
                         height=int(h),
                         boxes_before=len(boxes),
                         boxes_after=len(out_boxes),
+                        label_sha256=sha256_bytes(label_bytes),
                     )
                 )
         out_items.sort(key=lambda r: r.aug_item_id)
@@ -494,28 +467,6 @@ def _recipe(applied: list[Any]) -> str:
 
 
 # --------------------------------------------------------------------------------------
-
-
-def _skip_category(res: Resolution, annotation_failed: bool) -> str:
-    if res.status == ResolutionStatus.CONFLICT:
-        return SkipCategory.LABEL_CONFLICT
-    if res.reason in _UNTRUSTED_REASONS:
-        return SkipCategory.LABEL_UNTRUSTED
-    if annotation_failed:
-        return SkipCategory.ANNOTATION_FAILED
-    return SkipCategory.LABEL_UNAVAILABLE
-
-
-def _failed_inference(ws: Workspace, resolver: LabelResolver) -> set[str]:
-    lineage = resolver.annotation
-    if lineage.get("status") != "current":
-        return set()
-    path = ws.annotation_runs / lineage["run_id"] / "items.csv"
-    return {
-        r.item_id
-        for r in read_records(path, AnnotationItemRecord)
-        if r.inference_status != InferenceStatus.OK
-    }
 
 
 def _families(ws: Workspace) -> dict[str, str]:

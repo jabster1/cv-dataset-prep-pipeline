@@ -13,8 +13,11 @@ from cv_pipeline.annotation import AnnotationSetupError, run_annotate
 from cv_pipeline.augmentation import AugmentationError, run_augment
 from cv_pipeline.config import ConfigError, PipelineConfig, load_config
 from cv_pipeline.dataset_state import DatasetStateError
+from cv_pipeline.export import EXIT_EVALUATION_INCOMPLETE, EvaluationCoverageError, ExportError
+from cv_pipeline.export import run_export as _run_export
 from cv_pipeline.imports import ImportError_, run_import
 from cv_pipeline.labels import LabelPolicy, run_labels
+from cv_pipeline.labels.review_queue import MODES, ReviewQueueError, run_review_queue
 from cv_pipeline.pipeline import STAGES, exit_code_of, get_stage, run_prepare
 from cv_pipeline.splitting import SplitError, SplitHistoryError, run_split
 from cv_pipeline.utils.io import atomic_write_text
@@ -29,12 +32,15 @@ EPILOG = """exit codes:
   2  invalid configuration
   3  annotation completed and outputs were written, but one or more items failed inference
   4  split-history conflict: nothing in splits/ was changed (see reports/split.md)
+  5  export refused: strict evaluation policy and held-out items lack trusted labels
 """
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--config", "-c", required=True, help="Path to the pipeline YAML config")
-    p.add_argument("--log-level", default=None, help="Override console log level (DEBUG, INFO, ...)")
+    p.add_argument(
+        "--log-level", default=None, help="Override console log level (DEBUG, INFO, ...)"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,12 +68,21 @@ def build_parser() -> argparse.ArgumentParser:
         p.set_defaults(handler=_cmd_stage, stage=stage.name, force=False)
         if stage.name == "annotate":
             p.add_argument(
-                "--limit", type=int, default=None,
+                "--limit",
+                type=int,
+                default=None,
                 help="Only annotate the first N eligible items (by item_id), e.g. for smoke tests",
+            )
+        if stage.name == "export":
+            p.add_argument(
+                "--dry-run",
+                action="store_true",
+                help="Validate fingerprints, coverage, leakage, classes and counts; write nothing",
             )
         if stage.name == "augment":
             p.add_argument(
-                "--dry-run", action="store_true",
+                "--dry-run",
+                action="store_true",
                 help="Check eligibility and compute the run identity; generate nothing",
             )
         if stage.name == "split":
@@ -97,13 +112,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resolve the label for every eligible item (trusted human labels only by default)",
     )
     _add_common(p)
-    p.add_argument("--allow-machine-unreviewed", action="store_true",
-                   help="Opt in: use unreviewed machine labels (development/POC only)")
-    p.add_argument("--allow-imported-unverified", action="store_true",
-                   help="Opt in: use imported labels whose import has labels_trusted: false")
-    p.add_argument("--allow-machine-empty", action="store_true",
-                   help="Opt in: treat machine zero-detection results as negatives")
+    p.add_argument(
+        "--allow-machine-unreviewed",
+        action="store_true",
+        help="Opt in: use unreviewed machine labels (development/POC only)",
+    )
+    p.add_argument(
+        "--allow-imported-unverified",
+        action="store_true",
+        help="Opt in: use imported labels whose import has labels_trusted: false",
+    )
+    p.add_argument(
+        "--allow-machine-empty",
+        action="store_true",
+        help="Opt in: treat machine zero-detection results as negatives",
+    )
     p.set_defaults(handler=_cmd_labels)
+
+    p = sub.add_parser(
+        "review-queue",
+        help="Queue every item that needs human confirmation into review/ (trusts nothing)",
+    )
+    _add_common(p)
+    p.add_argument("--mode", choices=MODES, default="needs_confirmation")
+    p.add_argument("--split", choices=("all", "train", "val", "test"), default="all")
+    p.set_defaults(handler=_cmd_review_queue)
 
     p = sub.add_parser("show-config", help="Print the fully resolved configuration")
     _add_common(p)
@@ -121,6 +154,10 @@ def _cmd_stage(cfg: PipelineConfig, args: argparse.Namespace) -> int:
         if args.limit is not None and args.limit < 1:
             raise SystemExit("error: --limit must be >= 1")
         return exit_code_of(run_annotate(cfg, force=args.force, limit=args.limit))
+    if args.stage == "export":
+        result = _run_export(cfg, dry_run=args.dry_run)
+        _print_export_summary(result.report)
+        return result.exit_code
     if args.stage == "augment":
         return run_augment(cfg, dry_run=args.dry_run).exit_code
     if args.stage == "split":
@@ -142,9 +179,13 @@ def _cmd_stage(cfg: PipelineConfig, args: argparse.Namespace) -> int:
 def _cmd_import(cfg: PipelineConfig, args: argparse.Namespace) -> int:
     result = run_import(cfg, args.name, dry_run=args.dry_run)
     c = result.record["counts"]
-    state = "validated (dry run)" if result.dry_run else ("imported" if result.created else "unchanged")
-    print(f"{args.name}: {state} — {c['images']} images, {c['boxes']} boxes, "
-          f"labels {c['label_status']}, legacy splits {c['legacy_split']}")
+    state = (
+        "validated (dry run)" if result.dry_run else ("imported" if result.created else "unchanged")
+    )
+    print(
+        f"{args.name}: {state} — {c['images']} images, {c['boxes']} boxes, "
+        f"labels {c['label_status']}, legacy splits {c['legacy_split']}"
+    )
     return 0
 
 
@@ -164,7 +205,27 @@ def _print_resplit_preview(result) -> None:  # type: ignore[no-untyped-def]
         print(f"  {key}: {value} items")
     for w in report.get("warnings", []):
         print(f"  WARNING: {w}")
-    print(f"To apply, re-run with: --resplit --reason \"...\" --confirm {result.resplit_token}")
+    print(f'To apply, re-run with: --resplit --reason "..." --confirm {result.resplit_token}')
+
+
+def _cmd_review_queue(cfg: PipelineConfig, args: argparse.Namespace) -> int:
+    result = run_review_queue(cfg, mode=args.mode, split=args.split)
+    r = result.report
+    print(
+        f"Queued {r['queued']} item(s) in review/ ({r['with_machine_prelabel']} with machine "
+        f"pre-labels, {r['blank_for_manual_labelling']} blank). {r['next_step']}"
+    )
+    return 0
+
+
+def _print_export_summary(report: dict) -> None:  # type: ignore[type-arg]
+    print(
+        f"export {report['run_id']}: {report['status']}; images per split "
+        f"{report['images_per_split']}; incomplete_evaluation_set="
+        f"{str(report['incomplete_evaluation_set']).lower()}"
+    )
+    for s, c in report["heldout"].items():
+        print(f"  {s}: {c['exported']}/{c['total']} exported, coverage {c['coverage_pct']}%")
 
 
 def _cmd_show_config(cfg: PipelineConfig, args: argparse.Namespace) -> int:
@@ -193,6 +254,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as exc:
         logger.error(str(exc))
         return 2
+    except EvaluationCoverageError as exc:
+        logger.error(str(exc))
+        return EXIT_EVALUATION_INCOMPLETE
     except (
         FileNotFoundError,
         AnnotationSetupError,
@@ -201,6 +265,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         SplitError,
         ImportError_,
         AugmentationError,
+        ExportError,
+        ReviewQueueError,
     ) as exc:
         logger.error(str(exc))
         return 1

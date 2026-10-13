@@ -5,11 +5,11 @@ from cv_pipeline.augmentation.augment import (
     AugmentedItemRecord,
     AugmentResult,
     RejectedVariantRecord,
-    SkipCategory,
     SkippedItemRecord,
     run_augment,
     run_augment_stage,
 )
+from cv_pipeline.labels.usage import SkipCategory
 
 __all__ = [
     "AugmentResult",
