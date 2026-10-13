@@ -14,6 +14,7 @@ from cv_pipeline.annotation import run_annotate_stage
 from cv_pipeline.augmentation import run_augment_stage
 from cv_pipeline.config import PipelineConfig
 from cv_pipeline.dedup import run_dedup
+from cv_pipeline.export import run_export_stage
 from cv_pipeline.ingest import run_ingest
 from cv_pipeline.splitting import run_split_stage
 from cv_pipeline.utils.logging import get_logger, log_event
@@ -39,7 +40,8 @@ def exit_code_of(result: object) -> int:
     return int(getattr(result, "exit_code", 0) or 0)
 
 
-# Order matters: ``prepare`` runs these top to bottom. Later phases append export.
+# Order matters: ``prepare`` runs these top to bottom. ``labels`` and ``review-queue`` are
+# explicit commands (human review happens between stages).
 STAGES: list[Stage] = [
     Stage("ingest", "Copy images and sample video frames into the workspace", run_ingest),
     Stage("dedup", "Find exact and near-duplicate images; assign split groups", run_dedup),
@@ -60,6 +62,12 @@ STAGES: list[Stage] = [
         run_augment_stage,
         enabled=lambda cfg: cfg.augmentation.enabled,
     ),
+    Stage(
+        "export",
+        "Validated, immutable YOLO dataset export (strict held-out labels by default)",
+        run_export_stage,
+        enabled=lambda cfg: cfg.export.enabled,
+    ),
 ]
 
 
@@ -75,8 +83,11 @@ def run_prepare(cfg: PipelineConfig, force: bool = False) -> int:
     stages = [s for s in STAGES if s.enabled(cfg)]
     skipped = [s.name for s in STAGES if not s.enabled(cfg)]
     log_event(
-        logger, "prepare_started", project=cfg.project.name,
-        stages=[s.name for s in stages], skipped=skipped,
+        logger,
+        "prepare_started",
+        project=cfg.project.name,
+        stages=[s.name for s in stages],
+        skipped=skipped,
     )
     code = 0
     for stage in stages:

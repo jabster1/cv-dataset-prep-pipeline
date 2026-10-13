@@ -108,6 +108,14 @@ augmentation:
     gauss_noise:         {p: 0.2}
     affine:              {p: 0.4, scale: [0.85, 1.15], translate_percent: [-0.05, 0.05]}
 
+export:
+  enabled: false
+  label_policy: trusted_only
+  evaluation_policy: strict
+  augmentation_run: latest
+  classes: null                   # e.g. [padlock, lockout_tag] for a two-class detector
+  non_target_classes: error
+
 training:
   model: yolo11s.pt
   epochs: 150

@@ -15,6 +15,9 @@
 * ``corrected`` ``review/labels/<item_id>.txt`` is the trusted annotation
 * ``rejected``  the machine label from that run must not be used, under any policy
 
+``based_on_run_id: manual`` (with ``corrected`` only) records a label drawn from scratch for
+an item that never had a machine pre-annotation (e.g. annotation disabled or failed).
+
 Rows are processed in file order; the last row for an item wins (reviewers may revise).
 Review is never inferred from the existence of a label file.
 """

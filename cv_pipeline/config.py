@@ -167,6 +167,24 @@ class AugmentationConfig:
 
 
 @dataclass
+class ExportConfig:
+    """Validated YOLO dataset export (cv_pipeline/export)."""
+
+    enabled: bool = False  # prepare runs export only when true; `export` always runs
+    label_policy: Literal["trusted_only", "allow_machine_unreviewed"] = "trusted_only"
+    allow_machine_empty: bool = False  # only with allow_machine_unreviewed
+    # strict: refuse if any active val/test item lacks a usable trusted label.
+    # non_strict: export usable held-out items only, marked incomplete_evaluation_set.
+    evaluation_policy: Literal["strict", "non_strict"] = "strict"
+    augmentation_run: str = "latest"  # latest | none | <augmentation run id>
+    # Training taxonomy: ordered subset of project classes (null = all project classes).
+    # Export class ids are indices into this list.
+    classes: list[str] | None = None
+    # Boxes of project classes outside `classes`: error (refuse) | drop_boxes.
+    non_target_classes: Literal["error", "drop_boxes"] = "error"
+
+
+@dataclass
 class TrainingConfig:
     model: str = "yolo11n.pt"
     epochs: int = 100
@@ -191,6 +209,7 @@ class PipelineConfig:
     imports: list[ImportConfig] = field(default_factory=list)
     split: SplitConfig = field(default_factory=SplitConfig)
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
+    export: ExportConfig = field(default_factory=ExportConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     @property
@@ -383,6 +402,20 @@ def validate_config(cfg: PipelineConfig) -> None:
         resolve_transforms(aug.transforms)
     except TransformConfigError as exc:
         errors.append(str(exc))
+
+    # Export
+    e = cfg.export
+    check(
+        not (e.allow_machine_empty and e.label_policy != "allow_machine_unreviewed"),
+        "export.allow_machine_empty requires label_policy: allow_machine_unreviewed",
+    )
+    if e.classes is not None:
+        check(len(e.classes) > 0, "export.classes must not be empty (use null for all classes)")
+        unknown = sorted(set(e.classes) - set(cfg.classes))
+        check(not unknown, f"export.classes contains classes not in the project: {unknown}")
+        dup = sorted({c for c in e.classes if e.classes.count(c) > 1})
+        check(not dup, f"export.classes has duplicates: {dup}")
+    check(e.augmentation_run.strip() != "", "export.augmentation_run must not be empty")
 
     # Training
     t = cfg.training

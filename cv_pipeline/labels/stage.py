@@ -16,6 +16,7 @@ from typing import Any
 from cv_pipeline.config import PipelineConfig
 from cv_pipeline.labels.resolver import LabelPolicy, LabelResolver
 from cv_pipeline.labels.schema import Resolution
+from cv_pipeline.labels.usage import resolution_digest
 from cv_pipeline.manifest import (
     DuplicateKind,
     DuplicatePairRecord,
@@ -30,6 +31,8 @@ from cv_pipeline.utils.logging import get_logger, log_event
 from cv_pipeline.workspace import Workspace
 
 logger = get_logger("labels")
+
+LABELS_STATE_SCHEMA = "cvp-labels-state-v1"
 
 
 @dataclass
@@ -114,6 +117,16 @@ def run_labels(cfg: PipelineConfig, policy: LabelPolicy | None = None) -> Labels
 
     write_records(ws.labels_dir / "resolved.csv", records, ResolvedLabelRecord)
     write_records(ws.labels_dir / "boxes.csv", boxes, ResolvedBoxRecord)
+    # Fingerprint of this resolution; export refuses to run against a different one.
+    atomic_write_json(
+        ws.labels_dir / "state.json",
+        {
+            "schema": LABELS_STATE_SCHEMA,
+            "snapshot_fp": resolver.snapshot_fp,
+            "policy": policy.as_dict(),
+            "resolution_digest": resolution_digest(resolutions),
+        },
+    )
     report = _report(cfg, ws, resolver, policy, records, resolutions, split_note)
     atomic_write_json(ws.reports / "labels.json", report)
     atomic_write_text(ws.reports / "labels.md", _markdown(report))

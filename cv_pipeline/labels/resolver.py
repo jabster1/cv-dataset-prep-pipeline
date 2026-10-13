@@ -63,6 +63,9 @@ from cv_pipeline.splitting.split import annotation_lineage
 from cv_pipeline.utils.hashing import sha256_bytes
 from cv_pipeline.workspace import Workspace
 
+# ``based_on_run_id`` for a human label made without any machine pre-annotation.
+MANUAL_RUN = "manual"
+
 # Reason precedence when no usable label exists (most informative first).
 _REASON_ORDER = [
     UnavailableReason.REJECTED,
@@ -356,27 +359,35 @@ def _from_decisions(
         if item is None:
             bad(d, "unknown item_id (not in items.csv)")
             continue
-        if d.based_on_run_id not in runs:
-            runs[d.based_on_run_id] = _run_files(ws, d.based_on_run_id)
-        loaded = runs[d.based_on_run_id]
-        if loaded is None:
-            bad(d, f"annotation run {d.based_on_run_id} not found or not intact")
-            continue
-        run_items, run_boxes = loaded
-        run_item = run_items.get(iid)
-        if run_item is None:
-            bad(d, f"item not in annotation run {d.based_on_run_id}")
-            continue
-        if run_item.file_sha256 != item.sha256:
-            bad(d, "image content changed since the reviewed annotation run")
-            continue
-        if d.decision == "rejected":
-            rejected_runs[iid].add(d.based_on_run_id)
-            applied[iid] = d
-            continue
-        if run_item.inference_status != InferenceStatus.OK and d.decision == "accepted":
-            bad(d, "cannot accept: inference failed for this item in that run")
-            continue
+        manual = d.based_on_run_id == MANUAL_RUN
+        run_boxes: dict[str, list[LabelBox]] = {}
+        if manual:
+            # Labelled from scratch (no machine pre-annotation): only "corrected" is meaningful.
+            if d.decision != "corrected":
+                bad(d, f"based_on_run_id '{MANUAL_RUN}' is only valid with decision 'corrected'")
+                continue
+        else:
+            if d.based_on_run_id not in runs:
+                runs[d.based_on_run_id] = _run_files(ws, d.based_on_run_id)
+            loaded = runs[d.based_on_run_id]
+            if loaded is None:
+                bad(d, f"annotation run {d.based_on_run_id} not found or not intact")
+                continue
+            run_items, run_boxes = loaded
+            run_item = run_items.get(iid)
+            if run_item is None:
+                bad(d, f"item not in annotation run {d.based_on_run_id}")
+                continue
+            if run_item.file_sha256 != item.sha256:
+                bad(d, "image content changed since the reviewed annotation run")
+                continue
+            if d.decision == "rejected":
+                rejected_runs[iid].add(d.based_on_run_id)
+                applied[iid] = d
+                continue
+            if run_item.inference_status != InferenceStatus.OK and d.decision == "accepted":
+                bad(d, "cannot accept: inference failed for this item in that run")
+                continue
         label_file = ws.review / "labels" / f"{iid}.txt"
         if d.decision == "accepted":
             edited = (

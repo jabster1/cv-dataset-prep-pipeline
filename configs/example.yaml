@@ -115,6 +115,16 @@ augmentation:
   # off: horizontal_flip, rotate, gamma, perspective, bbox_safe_crop
   transforms: {}
 
+export:
+  enabled: false                  # prepare runs `export` only when true
+  label_policy: trusted_only      # must match `labels` (and `augment`) — see README
+  allow_machine_empty: false
+  evaluation_policy: strict       # strict: refuse if any val/test item lacks a trusted label
+                                  # non_strict: export usable items, marked incomplete_evaluation_set
+  augmentation_run: latest        # latest | none | <augmentation run id>
+  classes: null                   # training taxonomy (ordered subset); null = all project classes
+  non_target_classes: error       # error | drop_boxes (positives left box-free are excluded)
+
 training:
   model: yolo11n.pt
   epochs: 50
