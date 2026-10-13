@@ -69,6 +69,19 @@ review:
   copy_images: true               # copy images into review/images for labeling tools
   previews: true                  # draw predictions into review/previews
 
+# Existing labeled datasets (YOLO / Roboflow exports). Importing is always explicit:
+#   python -m cv_pipeline import-dataset --config configs/example.yaml --name <name>
+# Imported images join the same corpus (dedup, split groups, split history) as raw data.
+# Their legacy train/valid/test split is kept as metadata only.
+imports: []
+#  - name: roboflow_v3                # [a-z0-9_-]; imports are immutable, use a new name per version
+#    path: data/legacy/roboflow_v3    # export dir with data.yaml (read-only; never modified)
+#    format: yolo
+#    labels_trusted: true             # made by people -> provenance human_imported (trusted)
+#    empty_labels_are_negatives: false  # empty label files = confirmed "no objects"
+#    class_map: {}                    # source class name -> project class
+#    ignore_classes: []               # source classes deliberately dropped
+
 split:
   # Fractions of items (they must sum to 1; val/test may be 0). Split groups from dedup are
   # indivisible, so achieved fractions can deviate; the report explains how and why.

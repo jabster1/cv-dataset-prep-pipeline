@@ -67,6 +67,15 @@ review:
   copy_images: true
   previews: true
 
+imports: []
+#  - name: loto_roboflow_v1           # the historical, manually annotated dataset
+#    path: data/loto/legacy/roboflow_v1
+#    format: yolo
+#    labels_trusted: true
+#    empty_labels_are_negatives: true # only if empty files really mean "reviewed, nothing here"
+#    class_map: {lock: padlock, tag: lockout_tag}
+#    ignore_classes: []
+
 split:
   # Fractions of items (they must sum to 1; val/test may be 0). Split groups from dedup are
   # indivisible, so achieved fractions can deviate; the report explains how and why.

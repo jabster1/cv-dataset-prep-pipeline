@@ -12,6 +12,7 @@ they refer to* — never on machine predictions — and fingerprints exactly tha
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from cv_pipeline.config import PipelineConfig
 from cv_pipeline.dedup.report import dedup_settings
 from cv_pipeline.manifest import DedupRecord, ImageHashRecord, ItemRecord, read_records
 from cv_pipeline.utils.fingerprint import digest
+from cv_pipeline.utils.hashing import sha256_file
 from cv_pipeline.workspace import Workspace
 
 SPLIT_INPUT_SCHEMA = "cvp-split-input-v1"
@@ -168,4 +170,27 @@ def _check_dedup_content(
         raise DatasetStateError(
             f"dedup.csv was computed from different file content for {len(stale)} items "
             f"(e.g. {stale[0]}; workspace files changed since dedup) — re-run the dedup stage."
+        )
+
+
+def verify_workspace_files(
+    cfg: PipelineConfig, state: DatasetState, item_ids: Iterable[str]
+) -> None:
+    """Re-hash workspace image files and require them to match items.csv.
+
+    Used before producing derived outputs (resolved labels, later augmentation/export) so
+    that nothing is derived from bytes that differ from the validated dataset state.
+    """
+    ws = Workspace(cfg.workspace_dir)
+    bad = []
+    for iid in sorted(item_ids):
+        item = state.items[iid]
+        path = ws.root / item.path
+        actual = sha256_file(path) if path.is_file() else "<missing>"
+        if actual != item.sha256:
+            bad.append(iid)
+    if bad:
+        raise DatasetStateError(
+            f"{len(bad)} workspace image file(s) differ from items.csv (e.g. {bad[0]}); they "
+            "were modified or deleted after ingest — re-run ingest (with --force)."
         )

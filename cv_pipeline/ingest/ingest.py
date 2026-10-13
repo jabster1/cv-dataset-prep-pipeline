@@ -27,10 +27,13 @@ from cv_pipeline.config import PipelineConfig
 from cv_pipeline.ingest.images import ImageReadError, image_item_id, ingest_image
 from cv_pipeline.ingest.video import VideoReadError, iter_frames, probe_video, select_frame_indices
 from cv_pipeline.manifest import (
+    RAW_ORIGIN,
     ItemRecord,
     RejectedRecord,
     RejectReason,
+    SourceRefRecord,
     SourceType,
+    import_origin,
     read_records,
     write_records,
 )
@@ -109,45 +112,68 @@ def run_ingest(cfg: PipelineConfig, force: bool = False) -> IngestResult:
     t0 = time.perf_counter()
     log_event(logger, "ingest_started", raw_dir=str(raw_dir), files=len(files), force=force)
 
-    # Pass 1: classify and hash, so byte-identical files can be resolved to a canonical
-    # copy independently of discovery order.
-    supported: list[tuple[Path, str, str]] = []  # (path, rel, sha256)
+    # Pass 1: classify and hash every file from every origin (raw + configured imports),
+    # so byte-identical files resolve to one canonical copy independent of discovery order.
+    candidates: list[_Candidate] = []
     for src in files:
         rel = rel_posix(src, raw_dir)
         ext = src.suffix.lower()
         if ext not in image_exts and ext not in video_exts:
             result.rejected.append(
-                RejectedRecord(rel, RejectReason.UNSUPPORTED_EXTENSION, f"extension {ext or '<none>'}")
+                RejectedRecord(
+                    rel, RejectReason.UNSUPPORTED_EXTENSION, f"extension {ext or '<none>'}"
+                )
             )
-            log_event(logger, "file_rejected", logging.WARNING, file=rel, reason="unsupported_extension")
+            log_event(
+                logger, "file_rejected", logging.WARNING, file=rel, reason="unsupported_extension"
+            )
             continue
-        supported.append((src, rel, sha256_file(src)))
+        candidates.append(_Candidate(src, rel, sha256_file(src), RAW_ORIGIN, raw_dir, 0, ""))
+    candidates.extend(_import_candidates(cfg, result))
 
-    canonical: dict[str, str] = {}  # sha256 -> rel path of the canonical copy
-    for _, rel, sha in supported:
-        if sha not in canonical or canonical_path_key(rel) < canonical_path_key(canonical[sha]):
-            canonical[sha] = rel
+    canonical: dict[str, _Candidate] = {}  # sha256 -> canonical copy
+    for c in candidates:
+        if c.sha not in canonical or c.key < canonical[c.sha].key:
+            canonical[c.sha] = c
 
     # Pass 2: ingest canonical copies; record the others as exact duplicates.
-    for n, (src, rel, sha) in enumerate(supported, start=1):
-        is_image = src.suffix.lower() in image_exts
-        if canonical[sha] != rel:
-            keep = canonical[sha]
-            keep_is_image = PurePosixPath(keep).suffix.lower() in image_exts
-            keep_id = image_item_id(sha) if keep_is_image else video_source_id(sha)
+    for n, c in enumerate(candidates, start=1):
+        is_image = c.src.suffix.lower() in image_exts
+        keep = canonical[c.sha]
+        if keep is not c:
+            keep_is_image = PurePosixPath(keep.rel).suffix.lower() in image_exts
+            keep_id = image_item_id(c.sha) if keep_is_image else video_source_id(c.sha)
+            where = keep.rel if keep.origin == RAW_ORIGIN else f"{keep.origin}/{keep.rel}"
             result.rejected.append(
-                RejectedRecord(rel, RejectReason.EXACT_DUPLICATE, f"byte-identical to {keep}",
-                               duplicate_of=keep_id)
+                RejectedRecord(
+                    c.rel,
+                    RejectReason.EXACT_DUPLICATE,
+                    f"byte-identical to {where}",
+                    duplicate_of=keep_id,
+                    origin=c.origin,
+                )
             )
-            log_event(logger, "exact_duplicate", logging.WARNING, file=rel, canonical=keep)
+            log_event(
+                logger,
+                "exact_duplicate",
+                logging.WARNING,
+                file=c.rel,
+                origin=c.origin,
+                canonical=where,
+            )
         elif is_image:
-            _ingest_one_image(src, rel, sha, raw_dir, ws, previous, result)
+            _ingest_one_image(c.src, c.rel, c.sha, c.root, ws, previous, result, c.origin)
         else:
-            _ingest_one_video(src, rel, sha, raw_dir, ws, cfg, previous, result)
+            _ingest_one_video(c.src, c.rel, c.sha, c.root, ws, cfg, previous, result)
 
         if n % _PROGRESS_EVERY == 0:
-            log_event(logger, "ingest_progress", processed=n, total=len(supported))
+            log_event(logger, "ingest_progress", processed=n, total=len(candidates))
 
+    write_records(
+        ws.source_refs_manifest,
+        _source_refs(candidates, canonical, result, image_exts),
+        SourceRefRecord,
+    )
     result.items.sort(key=lambda r: r.item_id)
     write_records(ws.items_manifest, result.items, ItemRecord)
     write_records(ws.rejected_manifest, result.rejected, RejectedRecord)
@@ -165,6 +191,83 @@ def run_ingest(cfg: PipelineConfig, force: bool = False) -> IngestResult:
 
 
 # --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    src: Path
+    rel: str  # relative to ``root``
+    sha: str
+    origin: str
+    root: Path
+    origin_rank: int  # raw first, then imports by name
+    legacy_split: str
+
+    @property
+    def key(self) -> tuple[object, ...]:
+        """Canonical-copy preference among byte-identical files (lower wins)."""
+        return (self.origin_rank, *canonical_path_key(self.rel))
+
+
+def _import_candidates(cfg: PipelineConfig, result: IngestResult) -> list[_Candidate]:
+    """Validated images of every configured, imported dataset; bytes re-verified."""
+    from cv_pipeline.imports.importer import load_imports  # local: avoids import cycle
+
+    out = []
+    for rank, ds in enumerate(load_imports(cfg), start=1):
+        origin = import_origin(ds.name)
+        for img in ds.images:
+            src = ds.files_root / img.rel_path
+            sha = sha256_file(src) if src.is_file() else ""
+            if sha != img.sha256:
+                result.rejected.append(
+                    RejectedRecord(
+                        img.rel_path,
+                        RejectReason.IMPORT_FILE_MODIFIED,
+                        "imported file missing or changed since import",
+                        origin=origin,
+                    )
+                )
+                log_event(
+                    logger,
+                    "file_rejected",
+                    logging.WARNING,
+                    file=img.rel_path,
+                    origin=origin,
+                    reason=RejectReason.IMPORT_FILE_MODIFIED,
+                )
+                continue
+            out.append(
+                _Candidate(src, img.rel_path, sha, origin, ds.files_root, rank, img.legacy_split)
+            )
+    return out
+
+
+def _source_refs(
+    candidates: list[_Candidate],
+    canonical: dict[str, _Candidate],
+    result: IngestResult,
+    image_exts: set[str],
+) -> list[SourceRefRecord]:
+    present = {i.source_id for i in result.items}
+    refs = []
+    for c in candidates:
+        is_image = c.src.suffix.lower() in image_exts
+        source_id = image_item_id(c.sha) if is_image else video_source_id(c.sha)
+        if source_id not in present:
+            continue
+        refs.append(
+            SourceRefRecord(
+                source_id=source_id,
+                origin=c.origin,
+                source_path=c.rel,
+                source_sha256=c.sha,
+                role="canonical" if canonical[c.sha] is c else "duplicate",
+                legacy_split=c.legacy_split,
+            )
+        )
+    refs.sort(key=lambda r: (r.source_id, r.role != "canonical", r.origin, r.source_path))
+    return refs
 
 
 def _load_previous(ws: Workspace) -> dict[str, ItemRecord]:
@@ -189,11 +292,13 @@ def _ingest_one_image(
     ws: Workspace,
     previous: dict[str, ItemRecord],
     result: IngestResult,
+    origin: str = RAW_ORIGIN,
 ) -> None:
     prev = previous.get(image_item_id(sha))
     if _reusable(prev, ws, sha):
         assert prev is not None
         prev.source_path = rel  # file may have been moved/renamed in raw/
+        prev.origin = origin
         result.items.append(prev)
         result.images_ingested += 1
         result.reused += 1
@@ -201,9 +306,12 @@ def _ingest_one_image(
     try:
         rec = ingest_image(src, sha, raw_dir, ws.root, ws.interim_images)
     except ImageReadError as exc:
-        result.rejected.append(RejectedRecord(rel, RejectReason.UNREADABLE_IMAGE, str(exc)))
+        result.rejected.append(
+            RejectedRecord(rel, RejectReason.UNREADABLE_IMAGE, str(exc), origin=origin)
+        )
         log_event(logger, "file_rejected", logging.WARNING, file=rel, reason="unreadable_image")
         return
+    rec.origin = origin
     result.items.append(rec)
     result.images_ingested += 1
     log_event(logger, "image_ingested", logging.DEBUG, file=rel, item_id=rec.item_id)
@@ -272,8 +380,11 @@ def _ingest_one_video(
 
     if not frames:
         result.rejected.append(
-            RejectedRecord(rel, RejectReason.NO_FRAMES_EXTRACTED,
-                           f"{info.frame_count} frames reported, none decodable")
+            RejectedRecord(
+                rel,
+                RejectReason.NO_FRAMES_EXTRACTED,
+                f"{info.frame_count} frames reported, none decodable",
+            )
         )
         log_event(logger, "file_rejected", logging.WARNING, file=rel, reason="no_frames_extracted")
         return
@@ -300,7 +411,9 @@ def _warn_orphans(ws: Workspace, items: list[ItemRecord]) -> None:
     manifest is authoritative.
     """
     referenced = {(ws.root / r.path).resolve() for r in items}
-    orphans = [p for p in ws.interim_images.iterdir() if p.is_file() and p.resolve() not in referenced]
+    orphans = [
+        p for p in ws.interim_images.iterdir() if p.is_file() and p.resolve() not in referenced
+    ]
     if orphans:
         log_event(
             logger,

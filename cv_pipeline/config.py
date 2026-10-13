@@ -13,6 +13,7 @@ Design notes
 from __future__ import annotations
 
 import math
+import re
 import types
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -101,6 +102,22 @@ class AnnotationConfig:
 
 
 @dataclass
+class ImportConfig:
+    """An existing labeled dataset to import explicitly (``import-dataset --name``)."""
+
+    name: str
+    path: Path
+    format: Literal["yolo"] = "yolo"
+    # True: labels were made by people -> provenance human_imported (trusted).
+    # False: provenance imported_unverified (needs explicit opt-in to be used).
+    labels_trusted: bool = True
+    # Empty label files count as human-confirmed negatives (only if labels_trusted).
+    empty_labels_are_negatives: bool = False
+    class_map: dict[str, str] = field(default_factory=dict)  # source name -> project class
+    ignore_classes: list[str] = field(default_factory=list)  # source classes to drop
+
+
+@dataclass
 class ReviewConfig:
     export: Literal["flagged", "all"] = "flagged"
     copy_images: bool = True
@@ -154,6 +171,7 @@ class PipelineConfig:
     dedup: DedupConfig = field(default_factory=DedupConfig)
     annotation: AnnotationConfig = field(default_factory=AnnotationConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
+    imports: list[ImportConfig] = field(default_factory=list)
     split: SplitConfig = field(default_factory=SplitConfig)
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -205,6 +223,8 @@ def _resolve_paths(cfg: PipelineConfig, base_dir: Path) -> None:
 
     cfg.project.workspace = under_root(cfg.project.workspace)
     cfg.ingest.raw_dir = under_root(cfg.ingest.raw_dir)
+    for imp in cfg.imports:
+        imp.path = under_root(imp.path)
     if not cfg.training.runs_dir.is_absolute():
         cfg.training.runs_dir = (cfg.project.workspace / cfg.training.runs_dir).resolve()
 
@@ -283,6 +303,36 @@ def validate_config(cfg: PipelineConfig) -> None:
     check(not unknown_targets, f"annotation.class_map maps to unknown classes {unknown_targets}")
     # Backend-specific requirements (``model`` for yolo, registered backend name) are
     # checked when annotation is invoked, so other stages run with an incomplete section.
+
+    # Imports
+    names = [i.name for i in cfg.imports]
+    dup_names = sorted({n for n in names if names.count(n) > 1})
+    check(not dup_names, f"imports: duplicate import names {dup_names}")
+    for imp in cfg.imports:
+        where = f"imports[{imp.name}]"
+        check(
+            re.fullmatch(r"[a-z0-9][a-z0-9_-]*", imp.name) is not None,
+            f"{where}: name must match [a-z0-9][a-z0-9_-]*",
+        )
+        for other, label in ((ws, "project.workspace"), (raw, "ingest.raw_dir")):
+            check(
+                not (imp.path.is_relative_to(other) or other.is_relative_to(imp.path)),
+                f"{where}: path must not overlap {label} ({other})",
+            )
+        bad_targets = sorted(set(imp.class_map.values()) - set(cfg.classes))
+        check(not bad_targets, f"{where}: class_map maps to unknown classes {bad_targets}")
+        targets = list(imp.class_map.values())
+        merged = sorted({t for t in targets if targets.count(t) > 1})
+        check(
+            not merged,
+            f"{where}: several source classes map to the same project class {merged}",
+        )
+        both = sorted(set(imp.class_map) & set(imp.ignore_classes))
+        check(not both, f"{where}: classes both mapped and ignored: {both}")
+        check(
+            not (imp.empty_labels_are_negatives and not imp.labels_trusted),
+            f"{where}: empty_labels_are_negatives requires labels_trusted",
+        )
 
     # Split
     s = cfg.split

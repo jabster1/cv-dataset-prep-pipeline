@@ -45,6 +45,7 @@ class ItemRecord:
     frame_index: int | None = None
     timestamp_s: float | None = None
     parent_item_id: str | None = None
+    origin: str = "raw"  # "raw" or "import:<name>"; source_path is relative to that root
 
 
 @dataclass
@@ -55,6 +56,7 @@ class RejectedRecord:
     reason: str  # RejectReason
     detail: str = ""
     duplicate_of: str | None = None
+    origin: str = "raw"
 
 
 class RejectReason:
@@ -63,6 +65,28 @@ class RejectReason:
     UNREADABLE_VIDEO = "unreadable_video"
     NO_FRAMES_EXTRACTED = "no_frames_extracted"
     EXACT_DUPLICATE = "exact_duplicate"
+    IMPORT_FILE_MODIFIED = "import_file_modified"
+
+
+RAW_ORIGIN = "raw"
+
+
+def import_origin(name: str) -> str:
+    return f"import:{name}"
+
+
+@dataclass
+class SourceRefRecord:
+    """Every file that maps to a source, from any origin. Byte-identical files share a
+    ``source_id``; exactly one reference per source is ``canonical`` (the one in items.csv),
+    the rest are ``duplicate``. Provenance from all of them is preserved here."""
+
+    source_id: str
+    origin: str
+    source_path: str
+    source_sha256: str
+    role: str  # canonical | duplicate
+    legacy_split: str = ""  # train | val | test for imported datasets
 
 
 @dataclass
