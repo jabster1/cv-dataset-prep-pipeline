@@ -39,11 +39,15 @@ class ResolutionStatus:
     CONFLICT = "conflict"
 
 
+IGNORED_ONLY_NOTE = "ignored_only_source_annotation"
+
+
 class UnavailableReason:
     REJECTED = "rejected_by_reviewer"
     NOT_REVIEWED = "machine_label_not_reviewed"
     MACHINE_EMPTY = "machine_zero_detections_not_a_negative"
     EMPTY_NOT_CONFIRMED = "empty_label_not_confirmed_negative"
+    IGNORED_ONLY = "ignored_only_unconfirmed_negative"
     IMPORTED_UNVERIFIED = "imported_label_not_trusted"
     INVALID_LABEL = "invalid_imported_label"
     MISSING_LABEL = "imported_label_file_missing"

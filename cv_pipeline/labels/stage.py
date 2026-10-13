@@ -46,6 +46,7 @@ class ResolvedLabelRecord:
     label_sha256: str
     source_ref: str
     reason: str
+    label_notes: str = ""  # e.g. legacy_split=train;ignored_only_source_annotation
 
 
 @dataclass
@@ -93,6 +94,7 @@ def run_labels(cfg: PipelineConfig, policy: LabelPolicy | None = None) -> Labels
                 label_sha256=lab.label_sha256 if lab else "",
                 source_ref=lab.source_ref if lab else "",
                 reason=res.reason,
+                label_notes=";".join(lab.notes) if lab else "",
             )
         )
         if lab:
@@ -202,6 +204,9 @@ def _report(
             sorted(Counter(r.reason for r in records if r.status == "unavailable").items())
         ),
         "negatives": dict(sorted(Counter(r.provenance for r in records if r.negative).items())),
+        "negatives_from_ignored_only_annotations": sum(
+            1 for r in records if r.negative and "ignored_only_source_annotation" in r.label_notes
+        ),
         "by_split": {k: dict(sorted(v.items())) for k, v in sorted(by_split.items())},
         "legacy_vs_current_split": {
             k: dict(sorted(v.items())) for k, v in sorted(crosstab.items())

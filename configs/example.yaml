@@ -79,6 +79,7 @@ imports: []
 #    format: yolo
 #    labels_trusted: true             # made by people -> provenance human_imported (trusted)
 #    empty_labels_are_negatives: false  # empty label files = confirmed "no objects"
+#    ignored_only_labels_are_negatives: false  # files whose boxes are ALL ignored classes
 #    class_map: {}                    # source class name -> project class
 #    ignore_classes: []               # source classes deliberately dropped
 

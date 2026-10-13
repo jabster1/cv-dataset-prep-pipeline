@@ -48,6 +48,7 @@ from cv_pipeline.imports.importer import ImportedDataset, LabelStatus, load_impo
 from cv_pipeline.imports.yolo import parse_label
 from cv_pipeline.labels.decisions import InvalidDecision, ReviewDecision, read_decisions
 from cv_pipeline.labels.schema import (
+    IGNORED_ONLY_NOTE,
     PRIORITY,
     TRUSTED,
     LabelBox,
@@ -68,6 +69,7 @@ _REASON_ORDER = [
     UnavailableReason.NOT_REVIEWED,
     UnavailableReason.MACHINE_EMPTY,
     UnavailableReason.EMPTY_NOT_CONFIRMED,
+    UnavailableReason.IGNORED_ONLY,
     UnavailableReason.IMPORTED_UNVERIFIED,
     UnavailableReason.INVALID_LABEL,
     UnavailableReason.MISSING_LABEL,
@@ -194,6 +196,8 @@ class LabelResolver:
                     )
                 else:
                     reasons.add(UnavailableReason.MACHINE_EMPTY)
+            elif IGNORED_ONLY_NOTE in c.notes:
+                reasons.add(UnavailableReason.IGNORED_ONLY)
             else:
                 reasons.add(UnavailableReason.EMPTY_NOT_CONFIRMED)
 
@@ -250,10 +254,17 @@ def _from_imports(
                 ev.reasons.add(UnavailableReason.MISSING_LABEL)
                 continue
             boxes = tuple(sorted(boxes_by_rel.get(img.rel_path, [])))
+            notes: tuple[str, ...] = ("legacy_split=" + img.legacy_split,)
             if img.label_status == LabelStatus.EMPTY:
+                # Genuinely empty label file: a negative only under the explicit policy.
                 negative = ds.labels_trusted and ds.empty_labels_are_negatives
-            else:  # labeled; only ignored classes left -> person saw no project objects
-                negative = not boxes and ds.labels_trusted
+            elif not boxes:
+                # Every box was in ignore_classes. That does not prove the project's targets
+                # were looked for, so it is a negative only under its own explicit policy.
+                negative = ds.labels_trusted and ds.ignored_only_labels_are_negatives
+                notes = (*notes, IGNORED_ONLY_NOTE)
+            else:
+                negative = False
             ev.candidates.append(
                 LabelCandidate(
                     item_id=img.item_id,
@@ -264,7 +275,7 @@ def _from_imports(
                     file_sha256=img.sha256,
                     width=img.width,
                     height=img.height,
-                    notes=("legacy_split=" + img.legacy_split,),
+                    notes=notes,
                 )
             )
 

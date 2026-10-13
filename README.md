@@ -293,6 +293,7 @@ imports:
     format: yolo
     labels_trusted: true            # made by people -> provenance human_imported
     empty_labels_are_negatives: true  # empty label files = "reviewed, no target objects"
+    ignored_only_labels_are_negatives: false  # see "Empty labels and negative images"
     class_map: {lock: padlock}      # source class -> project class
     ignore_classes: []              # source classes deliberately dropped
 ```
@@ -331,9 +332,24 @@ python -m cv_pipeline labels --config C         # resolved labels + provenance r
   a separate, explicit option (not implemented).
 - **Integrity is checked twice.** Imported files are re-verified against `images.csv` at
   ingest, and workspace files are re-hashed before label output is produced.
-- **Roboflow augmentation copies are flagged.** File names like `x_jpg.rf.<hash>.jpg` that
-  share an original stem are reported, because augmented copies made at export time may
-  not be detected as near-duplicates.
+- **Roboflow derivative families always stay together.** Roboflow renames exported files
+  `<original stem>_<ext>.rf.<32 hex>.<ext>`, and an augmented export can contain several
+  transformed versions of one original. Flips, crops and similar changes are often not
+  caught by perceptual hashing.
+  - Files in one imported dataset that share an original stem form a lineage family. The
+    key is namespaced by dataset, `import:<name>:roboflow:<stem>`, so datasets never
+    collide.
+  - Dedup forces every family into one split group, even with dedup disabled.
+  - A family is not a duplicate: nothing is excluded or deleted because of it.
+  - Only names matching the pattern exactly form families; nothing is inferred otherwise.
+  - Family keys are recorded in `images.csv` and `source_refs.csv`, and counted in the
+    import and duplicates reports.
+- **Recommended workflow:** export future Roboflow versions **without augmentation**, and
+  let the pipeline own train-only augmentation. Older augmented exports remain safe
+  because of the family grouping.
+- **EXIF orientation is reported, not changed.** Imported images whose EXIF orientation tag
+  isn't 1 are listed in the import report and log, because they decode rotated. Files are
+  never modified.
 
 ## Label provenance and trust
 
@@ -361,6 +377,8 @@ don't need to know where a label came from.
 |---|---|
 | Imported empty file, trusted import, `empty_labels_are_negatives` | Trusted negative |
 | Imported empty file otherwise | Unavailable (`empty_label_not_confirmed_negative`) |
+| Imported file whose boxes are **all** in `ignore_classes`, trusted import, `ignored_only_labels_are_negatives: true` | Trusted negative, noted `ignored_only_source_annotation` |
+| Imported ignored-only file otherwise (the default) | Unavailable (`ignored_only_unconfirmed_negative`). Dropping other classes doesn't prove the project's targets were looked for. |
 | A human accepts a machine result with zero detections | Trusted negative |
 | Machine zero detections | **Never** a negative, even with `--allow-machine-unreviewed`, unless `--allow-machine-empty` is also given |
 | Failed or unreadable inference | No label |

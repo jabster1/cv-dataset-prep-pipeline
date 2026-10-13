@@ -25,7 +25,11 @@ import yaml
 
 LEGACY_SPLIT_NAMES = {"train": "train", "valid": "val", "val": "val", "test": "test"}
 COORD_TOLERANCE = 1e-6
-_ROBOFLOW_STEM = re.compile(r"^(?P<orig>.+)_(?:jpe?g|png|webp|bmp|tiff?)\.rf\.[0-9a-fA-F]+$")
+# Roboflow renames exported files to ``<original stem>_<original ext>.rf.<32 hex>.<ext>``.
+# Deliberately strict: anything else is not treated as a Roboflow family member.
+_ROBOFLOW_STEM = re.compile(
+    r"^(?P<orig>[^/]*[^/_])_(?:jpe?g|png|webp|bmp|tiff?)\.rf\.[0-9a-fA-F]{32}$", re.IGNORECASE
+)
 
 
 class ExportFormatError(ValueError):
@@ -58,10 +62,19 @@ class ParsedBox:
 
 
 def roboflow_key(rel_path: str) -> str:
-    """Original file stem for Roboflow-renamed files (``x_jpg.rf.<hash>.jpg`` -> ``x``)."""
+    """Original file stem for Roboflow-renamed files (``x_jpg.rf.<32 hex>.jpg`` -> ``x``);
+    empty when the name does not match the Roboflow pattern exactly."""
     stem = Path(rel_path).stem
     m = _ROBOFLOW_STEM.match(stem)
     return m.group("orig") if m else ""
+
+
+def family_key(import_name: str, rel_path: str) -> str:
+    """Leakage-prevention family of an imported file: derivatives of one original image
+    within ONE imported dataset. Namespaced by dataset so unrelated imports never collide.
+    Empty when the relationship cannot be established confidently."""
+    key = roboflow_key(rel_path)
+    return f"import:{import_name}:roboflow:{key}" if key else ""
 
 
 def parse_names(data: object) -> tuple[str, ...]:

@@ -40,6 +40,7 @@ def build_report(
     raw_duplicates: list[RejectedRecord],
     intra: list[dict[str, Any]],
     intra_counts: dict[str, int],
+    lineage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     d = cfg.dedup
     by_id = {i.item_id: i for i in items}
@@ -133,6 +134,7 @@ def build_report(
             "multi_source": sum(1 for s in sources_per_group.values() if len(s) > 1),
             "largest": {"split_group": largest_id, "items": largest_n, "fraction": largest_fraction},
         },
+        "lineage": lineage or {},
         "warnings": warnings,
         "notes": notes,
     }
@@ -167,6 +169,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"| Near-duplicate pairs within a source (not linked) | "
         f"{p['near_duplicate_same_source_not_linked']} |",
         f"| Duplicate groups | {len(report['duplicate_groups'])} |",
+        f"| Lineage families kept together (not duplicates) | "
+        f"{report.get('lineage', {}).get('families', 0)} "
+        f"({report.get('lineage', {}).get('sources', 0)} sources) |",
         f"| Split groups | {report['split_groups']['count']} "
         f"({report['split_groups']['multi_source']} span multiple sources) |",
         "",

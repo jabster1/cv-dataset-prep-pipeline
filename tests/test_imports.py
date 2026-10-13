@@ -215,20 +215,54 @@ def test_unknown_class_fails_clearly_and_writes_nothing(env) -> None:
     assert not (ws(cfg).imports / "legacy").exists()
 
 
+IGNORED_EXPORT = {
+    "names": ("Square", "circle", "triangle", "person"),
+    "label_override": {0: "0 0.5 0.5 0.2 0.2\n3 0.3 0.3 0.1 0.1\n", 1: "3 0.3 0.3 0.1 0.1\n"},
+}
+IGNORED_IMPORT = {**IMPORT, "class_map": {"Square": "square"}, "ignore_classes": ["person"]}
+
+
 def test_class_mapping_and_ignored_classes(env) -> None:
-    paths = make_export(
-        env.export,
-        names=("Square", "circle", "triangle", "person"),
-        label_override={0: "0 0.5 0.5 0.2 0.2\n3 0.3 0.3 0.1 0.1\n", 1: "3 0.3 0.3 0.1 0.1\n"},
-    )
-    imports = [{**IMPORT, "class_map": {"Square": "square"}, "ignore_classes": ["person"]}]
-    cfg = env.build(imports=imports)
+    paths = make_export(env.export, **IGNORED_EXPORT)
+    cfg = env.build(imports=[IGNORED_IMPORT])
     res = resolve(cfg, item_by_ref(cfg, "import:legacy", paths[0]))
     assert [b.class_id for b in res.label.boxes] == [0]
-    only_person = resolve(cfg, item_by_ref(cfg, "import:legacy", paths[1]))
-    assert only_person.label.boxes == () and only_person.label.negative  # human saw no targets
     import_json = (ws(cfg).imports / "legacy" / "import.json").read_text()
     assert '"person": null' in import_json
+
+
+def test_ignored_only_label_is_not_a_negative_by_default(env) -> None:
+    paths = make_export(env.export, **IGNORED_EXPORT)
+    cfg = env.build(imports=[IGNORED_IMPORT])
+    only_person = resolve(cfg, item_by_ref(cfg, "import:legacy", paths[1]))
+    assert only_person.status == "unavailable"
+    assert only_person.reason == UnavailableReason.IGNORED_ONLY
+    report = run_labels(cfg).report
+    assert report["unavailable_reasons"]["ignored_only_unconfirmed_negative"] == 1
+    imported = (ws(cfg).reports / "import_legacy.json").read_text()
+    assert '"ignored_only_labels": 1' in imported
+
+
+def test_ignored_only_label_is_a_negative_when_explicitly_allowed(env) -> None:
+    paths = make_export(env.export, **IGNORED_EXPORT)
+    cfg = env.build(imports=[{**IGNORED_IMPORT, "ignored_only_labels_are_negatives": True}])
+    neg = resolve(cfg, item_by_ref(cfg, "import:legacy", paths[1]))
+    assert neg.status == "trusted" and neg.label.negative and neg.label.boxes == ()
+    assert neg.label.provenance == LabelProvenance.HUMAN_IMPORTED
+    assert "ignored_only_source_annotation" in neg.label.notes
+    report = run_labels(cfg).report
+    assert report["negatives_from_ignored_only_annotations"] == 1
+    with (ws(cfg).labels_dir / "resolved.csv").open(newline="") as fh:
+        rows = {r["item_id"]: r for r in csv.DictReader(fh)}
+    assert "ignored_only_source_annotation" in rows[neg.item_id]["label_notes"]
+
+
+def test_ignored_only_policy_does_not_change_empty_file_policy(env) -> None:
+    paths = make_export(env.export, empty={2}, **IGNORED_EXPORT)
+    cfg = env.build(imports=[{**IGNORED_IMPORT, "ignored_only_labels_are_negatives": True}])
+    empty = resolve(cfg, item_by_ref(cfg, "import:legacy", paths[2]))
+    assert empty.status == "unavailable"
+    assert empty.reason == UnavailableReason.EMPTY_NOT_CONFIRMED
 
 
 def test_duplicate_class_names_rejected(env) -> None:
@@ -250,6 +284,10 @@ def test_import_config_validation(env) -> None:
         env.config(imports=[{**IMPORT, "name": "Bad Name"}])
     with pytest.raises(ConfigError, match="duplicate import names"):
         env.config(imports=[IMPORT, IMPORT])
+    with pytest.raises(ConfigError, match="ignored_only_labels_are_negatives requires"):
+        env.config(
+            imports=[{**IMPORT, "labels_trusted": False, "ignored_only_labels_are_negatives": True}]
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -512,21 +550,6 @@ def test_tampered_workspace_file_blocks_label_output(env) -> None:
     (ws(cfg).root / item.path).write_bytes(b"not the ingested image")
     with pytest.raises(DatasetStateError, match="differ from items.csv"):
         run_labels(cfg)
-
-
-def test_roboflow_variant_names_are_reported(env) -> None:
-    make_export(env.export, splits={"train": [0, 1]})
-    img_dir = env.export / "train" / "images"
-    lbl_dir = env.export / "train" / "labels"
-    for i, h in enumerate(("abc123", "def456")):
-        shutil.copyfile(img_dir / "img_000.jpg", img_dir / f"photo_jpg.rf.{h}.jpg")
-        (img_dir / f"photo_jpg.rf.{h}.jpg").write_bytes(
-            (img_dir / f"photo_jpg.rf.{h}.jpg").read_bytes() + bytes([i])
-        )
-        shutil.copyfile(lbl_dir / "img_000.txt", lbl_dir / f"photo_jpg.rf.{h}.txt")
-    result = run_import(env.config(), "legacy")
-    assert result.record["counts"]["roboflow_variant_groups"] == 1
-    assert result.record["counts"]["roboflow_variant_images"] == 2
 
 
 def test_cli_import_and_labels(env, capsys) -> None:

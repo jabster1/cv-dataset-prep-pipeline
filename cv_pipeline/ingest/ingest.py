@@ -202,6 +202,7 @@ class _Candidate:
     root: Path
     origin_rank: int  # raw first, then imports by name
     legacy_split: str
+    family_key: str = ""
 
     @property
     def key(self) -> tuple[object, ...]:
@@ -238,7 +239,10 @@ def _import_candidates(cfg: PipelineConfig, result: IngestResult) -> list[_Candi
                 )
                 continue
             out.append(
-                _Candidate(src, img.rel_path, sha, origin, ds.files_root, rank, img.legacy_split)
+                _Candidate(
+                    src, img.rel_path, sha, origin, ds.files_root, rank, img.legacy_split,
+                    img.family_key,
+                )
             )
     return out
 
@@ -264,6 +268,7 @@ def _source_refs(
                 source_sha256=c.sha,
                 role="canonical" if canonical[c.sha] is c else "duplicate",
                 legacy_split=c.legacy_split,
+                family_key=c.family_key,
             )
         )
     refs.sort(key=lambda r: (r.source_id, r.role != "canonical", r.origin, r.source_path))

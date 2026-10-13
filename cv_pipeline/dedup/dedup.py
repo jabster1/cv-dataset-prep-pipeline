@@ -31,6 +31,7 @@ from cv_pipeline.canonical import canonical_path_key
 from cv_pipeline.config import DedupConfig, PipelineConfig
 from cv_pipeline.dedup.hashing import ImageHashes, compute_hashes, hamming, hex_matrix, near_pairs
 from cv_pipeline.dedup.report import build_report, render_markdown
+from cv_pipeline.lineage import family_links, lineage_summary
 from cv_pipeline.manifest import (
     DedupRecord,
     DuplicateKind,
@@ -81,7 +82,10 @@ def run_dedup(cfg: PipelineConfig, force: bool = False) -> DedupResult:
     by_id = {r.item_id: r for r in items}
     exclusions = _assign_exclusions(items, pairs, dcfg)
     dup_groups = _dup_groups(pairs)
-    split_groups = _split_groups(items, pairs, by_id, dcfg)
+    # Lineage families (e.g. Roboflow derivatives of one original) always share a split
+    # group, whether or not perceptual hashing links them. They are not duplicates.
+    links = family_links(ws, {i.source_id for i in items})
+    split_groups = _split_groups(items, pairs, by_id, dcfg, links)
 
     records = []
     for item in items:
@@ -103,7 +107,9 @@ def run_dedup(cfg: PipelineConfig, force: bool = False) -> DedupResult:
         )
 
     intra = _intra_source_summary(items, hashes, dcfg) if dcfg.enabled else []
-    report = build_report(cfg, items, records, pairs, raw_duplicates, intra, intra_counts)
+    report = build_report(
+        cfg, items, records, pairs, raw_duplicates, intra, intra_counts, lineage_summary(links)
+    )
 
     write_records(ws.dedup_manifest, records, DedupRecord)
     write_records(ws.duplicate_pairs_manifest, pairs, DuplicatePairRecord)
@@ -326,9 +332,11 @@ def _split_groups(
     pairs: list[DuplicatePairRecord],
     by_id: dict[str, ItemRecord],
     dcfg: DedupConfig,
+    links: dict[str, tuple[str, ...]],
 ) -> dict[str, str]:
-    """source_id -> split-group id. Sources joined by exact pairs (always) and cross-source
-    near-duplicates (when ``group_near_duplicates``) share a group."""
+    """source_id -> split-group id. Sources joined by exact pairs (always), cross-source
+    near-duplicates (when ``group_near_duplicates``) and lineage families (always) share
+    a group."""
     uf = _UnionFind()
     for item in items:
         uf.find(item.source_id)
@@ -336,6 +344,9 @@ def _split_groups(
         if p.kind == DuplicateKind.NEAR_DUPLICATE and not dcfg.group_near_duplicates:
             continue
         uf.union(by_id[p.item_a].source_id, by_id[p.item_b].source_id)
+    for members in links.values():
+        for other in members[1:]:
+            uf.union(members[0], other)
     out: dict[str, str] = {}
     for members in uf.components().values():
         gid = members[0] if len(members) == 1 else _group_id("sg", members)

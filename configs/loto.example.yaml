@@ -73,6 +73,8 @@ imports: []
 #    format: yolo
 #    labels_trusted: true
 #    empty_labels_are_negatives: true # only if empty files really mean "reviewed, nothing here"
+#    ignored_only_labels_are_negatives: false
+#    # Prefer exporting Roboflow versions WITHOUT augmentation; the pipeline augments train only.
 #    class_map: {lock: padlock, tag: lockout_tag}
 #    ignore_classes: []
 

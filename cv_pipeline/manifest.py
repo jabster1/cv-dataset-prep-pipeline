@@ -87,6 +87,7 @@ class SourceRefRecord:
     source_sha256: str
     role: str  # canonical | duplicate
     legacy_split: str = ""  # train | val | test for imported datasets
+    family_key: str = ""  # must-stay-together lineage family (see cv_pipeline.lineage)
 
 
 @dataclass

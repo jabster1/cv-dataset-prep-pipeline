@@ -113,6 +113,10 @@ class ImportConfig:
     labels_trusted: bool = True
     # Empty label files count as human-confirmed negatives (only if labels_trusted).
     empty_labels_are_negatives: bool = False
+    # Label files whose boxes are ALL in ignore_classes count as negatives for the project
+    # classes (only if labels_trusted). Off by default: dropping other classes does not
+    # prove the project's targets were looked for and found absent.
+    ignored_only_labels_are_negatives: bool = False
     class_map: dict[str, str] = field(default_factory=dict)  # source name -> project class
     ignore_classes: list[str] = field(default_factory=list)  # source classes to drop
 
@@ -332,6 +336,10 @@ def validate_config(cfg: PipelineConfig) -> None:
         check(
             not (imp.empty_labels_are_negatives and not imp.labels_trusted),
             f"{where}: empty_labels_are_negatives requires labels_trusted",
+        )
+        check(
+            not (imp.ignored_only_labels_are_negatives and not imp.labels_trusted),
+            f"{where}: ignored_only_labels_are_negatives requires labels_trusted",
         )
 
     # Split
